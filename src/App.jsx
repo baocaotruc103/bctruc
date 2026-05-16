@@ -21,7 +21,6 @@ import {
   UserCog,
   X,
 } from 'lucide-react'
-import { createWorker } from 'tesseract.js'
 import {
   departments,
   defaultReportMeta,
@@ -129,8 +128,33 @@ function appendText(currentValue, nextText) {
   return [currentValue.trim(), cleaned].filter(Boolean).join('\n')
 }
 
+function countVietnameseMojibakeMarkers(text) {
+  const matches = text.match(/[ÃÄÂÁá][\u0080-\u00ff]|[\u0080-\u009f]/g)
+  return matches?.length || 0
+}
+
+function countVietnameseCharacters(text) {
+  const matches = text.match(/[ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠƯàáâãèéêìíòóôõùúăđĩũơưẠ-ỹ]/g)
+  return matches?.length || 0
+}
+
+function repairVietnameseMojibake(text) {
+  if (!countVietnameseMojibakeMarkers(text)) return text
+
+  try {
+    const bytes = Uint8Array.from(Array.from(text, (char) => char.charCodeAt(0) & 0xff))
+    const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+    const originalScore = countVietnameseCharacters(text) - countVietnameseMojibakeMarkers(text) * 3
+    const decodedScore = countVietnameseCharacters(decoded) - countVietnameseMojibakeMarkers(decoded) * 3
+
+    return decodedScore > originalScore ? decoded : text
+  } catch {
+    return text
+  }
+}
+
 function normalizeVietnameseOcrText(text) {
-  return text
+  return repairVietnameseMojibake(text)
     .normalize('NFC')
     .replace(/\r\n/g, '\n')
     .replace(/[^\S\n]+/g, ' ')
@@ -185,6 +209,41 @@ function preprocessOcrImage(sourceCanvas) {
 
   targetContext.putImageData(image, 0, 0)
   return canvas
+}
+
+async function readTextWithOcrSpace(sourceCanvas) {
+  const imageDataUrl = preprocessOcrImage(sourceCanvas).toDataURL('image/png')
+  const formData = new FormData()
+  formData.append('base64Image', imageDataUrl)
+  formData.append('language', 'vnm')
+  formData.append('isOverlayRequired', 'false')
+  formData.append('scale', 'true')
+  formData.append('OCREngine', '2')
+
+  const response = await fetch('https://api.ocr.space/parse/image', {
+    method: 'POST',
+    headers: {
+      apikey: import.meta.env.VITE_OCR_SPACE_API_KEY?.trim() || 'helloworld',
+    },
+    body: formData,
+  })
+
+  if (!response.ok) {
+    throw new Error(`OCR.space HTTP ${response.status}`)
+  }
+
+  const result = await response.json()
+  if (result.IsErroredOnProcessing) {
+    const message = Array.isArray(result.ErrorMessage)
+      ? result.ErrorMessage.join(' ')
+      : result.ErrorMessage || result.ErrorDetails || 'OCR.space không xử lý được ảnh.'
+    throw new Error(message)
+  }
+
+  return result.ParsedResults
+    ?.map((item) => item.ParsedText || '')
+    .join('\n')
+    .trim() || ''
 }
 
 function CaptureTextarea({ label, value, onChange }) {
@@ -395,14 +454,7 @@ function CameraTextScanner({ onClose, onConfirm }) {
     )
 
     try {
-      const worker = await createWorker('vie+eng')
-      await worker.setParameters({
-        preserve_interword_spaces: '1',
-        tessedit_pageseg_mode: '6',
-      })
-      const { data } = await worker.recognize(preprocessOcrImage(canvas))
-      await worker.terminate()
-      const text = normalizeVietnameseOcrText(data.text)
+      const text = normalizeVietnameseOcrText(await readTextWithOcrSpace(canvas))
       setOcrText(text)
       setStatus(text ? 'Đã quét xong. Kiểm tra nội dung rồi xác nhận.' : 'Không nhận được chữ trong vùng đã chọn.')
     } catch (error) {
