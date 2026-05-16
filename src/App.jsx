@@ -190,18 +190,21 @@ function getVideoDisplayRect(video, frame) {
 
 function preprocessOcrImage(sourceCanvas) {
   const canvas = document.createElement('canvas')
-  canvas.width = sourceCanvas.width
-  canvas.height = sourceCanvas.height
+  const scale = Math.min(3, Math.max(1.5, 1400 / Math.max(sourceCanvas.width, 1)))
+  canvas.width = Math.round(sourceCanvas.width * scale)
+  canvas.height = Math.round(sourceCanvas.height * scale)
 
-  const sourceContext = sourceCanvas.getContext('2d')
   const targetContext = canvas.getContext('2d', { willReadFrequently: true })
-  const image = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height)
+  targetContext.imageSmoothingEnabled = true
+  targetContext.imageSmoothingQuality = 'high'
+  targetContext.drawImage(sourceCanvas, 0, 0, canvas.width, canvas.height)
+
+  const image = targetContext.getImageData(0, 0, canvas.width, canvas.height)
   const { data } = image
 
   for (let index = 0; index < data.length; index += 4) {
     const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114
-    const contrasted = Math.max(0, Math.min(255, (gray - 128) * 1.35 + 128))
-    const value = contrasted > 165 ? 255 : 0
+    const value = Math.max(0, Math.min(255, (gray - 128) * 1.28 + 136))
     data[index] = value
     data[index + 1] = value
     data[index + 2] = value
@@ -218,7 +221,9 @@ async function readTextWithOcrSpace(sourceCanvas) {
   formData.append('language', 'vnm')
   formData.append('isOverlayRequired', 'false')
   formData.append('scale', 'true')
-  formData.append('OCREngine', '2')
+  formData.append('detectOrientation', 'true')
+  formData.append('filetype', 'PNG')
+  formData.append('OCREngine', '1')
 
   const response = await fetch('https://api.ocr.space/parse/image', {
     method: 'POST',
@@ -379,8 +384,13 @@ function CameraTextScanner({ onClose, onConfirm }) {
     if (!frame) return null
 
     const rect = frame.getBoundingClientRect()
-    const x = Math.max(0, Math.min(event.clientX - rect.left, rect.width))
-    const y = Math.max(0, Math.min(event.clientY - rect.top, rect.height))
+    const cropRect = capturedImage && imageRef.current
+      ? imageRef.current.getBoundingClientRect()
+      : rect
+    const left = cropRect.left - rect.left
+    const top = cropRect.top - rect.top
+    const x = Math.max(left, Math.min(event.clientX - rect.left, left + cropRect.width))
+    const y = Math.max(top, Math.min(event.clientY - rect.top, top + cropRect.height))
 
     return {
       x,
@@ -457,22 +467,33 @@ function CameraTextScanner({ onClose, onConfirm }) {
 
     setStatus('Đang OCR vùng crop...')
     const frameRect = frame.getBoundingClientRect()
+    const imageRect = image.getBoundingClientRect()
+    const imageBounds = {
+      x: imageRect.left - frameRect.left,
+      y: imageRect.top - frameRect.top,
+      width: imageRect.width,
+      height: imageRect.height,
+    }
     const selected = selection?.width > 12 && selection?.height > 12
       ? selection
-      : { x: 0, y: 0, width: frameRect.width, height: frameRect.height }
+      : imageBounds
 
-    const scaleX = image.naturalWidth / frameRect.width
-    const scaleY = image.naturalHeight / frameRect.height
-    canvas.width = Math.max(1, Math.round(selected.width * scaleX))
-    canvas.height = Math.max(1, Math.round(selected.height * scaleY))
+    const sourceX = Math.max(0, selected.x - imageBounds.x)
+    const sourceY = Math.max(0, selected.y - imageBounds.y)
+    const sourceWidth = Math.min(selected.width, imageBounds.width - sourceX)
+    const sourceHeight = Math.min(selected.height, imageBounds.height - sourceY)
+    const scaleX = image.naturalWidth / imageBounds.width
+    const scaleY = image.naturalHeight / imageBounds.height
+    canvas.width = Math.max(1, Math.round(sourceWidth * scaleX))
+    canvas.height = Math.max(1, Math.round(sourceHeight * scaleY))
 
     const context = canvas.getContext('2d')
     context.drawImage(
       image,
-      selected.x * scaleX,
-      selected.y * scaleY,
-      selected.width * scaleX,
-      selected.height * scaleY,
+      sourceX * scaleX,
+      sourceY * scaleY,
+      sourceWidth * scaleX,
+      sourceHeight * scaleY,
       0,
       0,
       canvas.width,
