@@ -223,7 +223,7 @@ async function readTextWithOcrSpace(sourceCanvas) {
   formData.append('scale', 'true')
   formData.append('detectOrientation', 'true')
   formData.append('filetype', 'PNG')
-  formData.append('OCREngine', '1')
+  formData.append('OCREngine', '2')
 
   const response = await fetch('https://api.ocr.space/parse/image', {
     method: 'POST',
