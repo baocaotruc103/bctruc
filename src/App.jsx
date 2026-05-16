@@ -30,7 +30,12 @@ import {
   initialUsers,
 } from './data/sampleData'
 import { isSupabaseConfigured } from './lib/supabase'
-import { saveDutyReport } from './services/reportService'
+import {
+  deleteDutyReport,
+  loadAppData,
+  loadReportEntries,
+  saveDutyReport,
+} from './services/reportService'
 
 const patientTemplate = {
   idbn: '',
@@ -80,6 +85,10 @@ function todayISO() {
   return `${year}-${month}-${day}`
 }
 
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+}
+
 function computeDailyStats(patients, reportDate) {
   return {
     admissions: patients.filter((patient) => patient.admissionDate === reportDate).length,
@@ -118,6 +127,64 @@ function appendText(currentValue, nextText) {
   const cleaned = nextText.trim()
   if (!cleaned) return currentValue
   return [currentValue.trim(), cleaned].filter(Boolean).join('\n')
+}
+
+function normalizeVietnameseOcrText(text) {
+  return text
+    .normalize('NFC')
+    .replace(/\r\n/g, '\n')
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+function getVideoDisplayRect(video, frame) {
+  const frameRect = frame.getBoundingClientRect()
+  const videoWidth = video.videoWidth || frameRect.width
+  const videoHeight = video.videoHeight || frameRect.height
+  const frameRatio = frameRect.width / frameRect.height
+  const videoRatio = videoWidth / videoHeight
+
+  if (videoRatio > frameRatio) {
+    const height = frameRect.width / videoRatio
+    return {
+      left: 0,
+      top: (frameRect.height - height) / 2,
+      width: frameRect.width,
+      height,
+    }
+  }
+
+  const width = frameRect.height * videoRatio
+  return {
+    left: (frameRect.width - width) / 2,
+    top: 0,
+    width,
+    height: frameRect.height,
+  }
+}
+
+function preprocessOcrImage(sourceCanvas) {
+  const canvas = document.createElement('canvas')
+  canvas.width = sourceCanvas.width
+  canvas.height = sourceCanvas.height
+
+  const sourceContext = sourceCanvas.getContext('2d')
+  const targetContext = canvas.getContext('2d', { willReadFrequently: true })
+  const image = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height)
+  const { data } = image
+
+  for (let index = 0; index < data.length; index += 4) {
+    const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114
+    const contrasted = Math.max(0, Math.min(255, (gray - 128) * 1.35 + 128))
+    const value = contrasted > 165 ? 255 : 0
+    data[index] = value
+    data[index + 1] = value
+    data[index + 2] = value
+  }
+
+  targetContext.putImageData(image, 0, 0)
+  return canvas
 }
 
 function CaptureTextarea({ label, value, onChange }) {
@@ -208,9 +275,9 @@ function CameraTextScanner({ onClose, onConfirm }) {
   const videoRef = useRef(null)
   const canvasRef = useRef(null)
   const frameRef = useRef(null)
+  const dragStartRef = useRef(null)
   const [stream, setStream] = useState(null)
   const [selection, setSelection] = useState(null)
-  const [dragStart, setDragStart] = useState(null)
   const [ocrText, setOcrText] = useState('')
   const [status, setStatus] = useState('Đang mở camera...')
 
@@ -227,7 +294,7 @@ function CameraTextScanner({ onClose, onConfirm }) {
         if (videoRef.current) {
           videoRef.current.srcObject = activeStream
         }
-        setStatus('Kéo chuột hoặc chạm để chọn vùng chữ cần quét.')
+        setStatus('Chạm và kéo trên khung camera để chọn vùng chữ cần quét.')
       } catch (error) {
         setStatus(`Không mở được camera: ${error.message}`)
       }
@@ -247,22 +314,36 @@ function CameraTextScanner({ onClose, onConfirm }) {
   }, [stream])
 
   const pointFromEvent = (event) => {
-    const rect = frameRef.current.getBoundingClientRect()
+    const video = videoRef.current
+    const frame = frameRef.current
+    if (!video || !frame) return null
+
+    const rect = frame.getBoundingClientRect()
+    const videoRect = getVideoDisplayRect(video, frame)
+    const x = Math.max(videoRect.left, Math.min(event.clientX - rect.left, videoRect.left + videoRect.width))
+    const y = Math.max(videoRect.top, Math.min(event.clientY - rect.top, videoRect.top + videoRect.height))
+
     return {
-      x: Math.max(0, Math.min(event.clientX - rect.left, rect.width)),
-      y: Math.max(0, Math.min(event.clientY - rect.top, rect.height)),
+      x,
+      y,
     }
   }
 
   const handlePointerDown = (event) => {
+    event.preventDefault()
+    event.currentTarget.setPointerCapture?.(event.pointerId)
     const point = pointFromEvent(event)
-    setDragStart(point)
+    if (!point) return
+    dragStartRef.current = point
     setSelection({ x: point.x, y: point.y, width: 0, height: 0 })
   }
 
   const handlePointerMove = (event) => {
-    if (!dragStart) return
+    if (!dragStartRef.current) return
+    event.preventDefault()
     const point = pointFromEvent(event)
+    if (!point) return
+    const dragStart = dragStartRef.current
     setSelection({
       x: Math.min(dragStart.x, point.x),
       y: Math.min(dragStart.y, point.y),
@@ -271,8 +352,9 @@ function CameraTextScanner({ onClose, onConfirm }) {
     })
   }
 
-  const handlePointerUp = () => {
-    setDragStart(null)
+  const handlePointerUp = (event) => {
+    dragStartRef.current = null
+    event.currentTarget.releasePointerCapture?.(event.pointerId)
   }
 
   const scanSelectedRegion = async () => {
@@ -281,22 +363,29 @@ function CameraTextScanner({ onClose, onConfirm }) {
     const frame = frameRef.current
     if (!video || !canvas || !frame) return
 
+    if (!video.videoWidth || !video.videoHeight) {
+      setStatus('Camera chưa sẵn sàng, vui lòng thử lại sau vài giây.')
+      return
+    }
+
     setStatus('Đang quét chữ...')
-    const frameRect = frame.getBoundingClientRect()
+    const videoRect = getVideoDisplayRect(video, frame)
     const selected = selection?.width > 12 && selection?.height > 12
       ? selection
-      : { x: 0, y: 0, width: frameRect.width, height: frameRect.height }
+      : videoRect
 
-    const scaleX = video.videoWidth / frameRect.width
-    const scaleY = video.videoHeight / frameRect.height
+    const sourceX = Math.max(0, selected.x - videoRect.left)
+    const sourceY = Math.max(0, selected.y - videoRect.top)
+    const scaleX = video.videoWidth / videoRect.width
+    const scaleY = video.videoHeight / videoRect.height
     canvas.width = Math.max(1, Math.round(selected.width * scaleX))
     canvas.height = Math.max(1, Math.round(selected.height * scaleY))
 
     const context = canvas.getContext('2d')
     context.drawImage(
       video,
-      selected.x * scaleX,
-      selected.y * scaleY,
+      sourceX * scaleX,
+      sourceY * scaleY,
       selected.width * scaleX,
       selected.height * scaleY,
       0,
@@ -307,9 +396,13 @@ function CameraTextScanner({ onClose, onConfirm }) {
 
     try {
       const worker = await createWorker('vie+eng')
-      const { data } = await worker.recognize(canvas)
+      await worker.setParameters({
+        preserve_interword_spaces: '1',
+        tessedit_pageseg_mode: '6',
+      })
+      const { data } = await worker.recognize(preprocessOcrImage(canvas))
       await worker.terminate()
-      const text = data.text.trim()
+      const text = normalizeVietnameseOcrText(data.text)
       setOcrText(text)
       setStatus(text ? 'Đã quét xong. Kiểm tra nội dung rồi xác nhận.' : 'Không nhận được chữ trong vùng đã chọn.')
     } catch (error) {
@@ -332,12 +425,14 @@ function CameraTextScanner({ onClose, onConfirm }) {
         <div className="grid gap-4 p-4 lg:grid-cols-[1fr_320px]">
           <div
             ref={frameRef}
-            className="relative overflow-hidden rounded-lg bg-slate-900"
+            className="relative touch-none select-none overflow-hidden rounded-lg bg-slate-900"
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
+            onPointerCancel={handlePointerUp}
+            onPointerLeave={handlePointerUp}
           >
-            <video ref={videoRef} autoPlay playsInline muted className="max-h-[62vh] min-h-[320px] w-full object-contain" />
+            <video ref={videoRef} autoPlay playsInline muted className="pointer-events-none max-h-[62vh] min-h-[320px] w-full object-contain" />
             {selection && (
               <div
                 className="pointer-events-none absolute border-2 border-hospital-500 bg-hospital-500/10"
@@ -363,7 +458,7 @@ function CameraTextScanner({ onClose, onConfirm }) {
             <textarea
               className="field-textarea min-h-[180px]"
               value={ocrText}
-              onChange={(event) => setOcrText(event.target.value)}
+              onChange={(event) => setOcrText(normalizeVietnameseOcrText(event.target.value))}
               placeholder="Kết quả OCR sẽ hiển thị tại đây"
             />
             <div className="flex justify-end gap-2">
@@ -1069,6 +1164,54 @@ export default function App() {
   const [saveState, setSaveState] = useState('idle')
   const [message, setMessage] = useState('')
 
+  useEffect(() => {
+    let ignore = false
+
+    async function loadInitialData() {
+      if (!isSupabaseConfigured) return
+
+      setMessage('Dang tai du lieu tu Supabase...')
+
+      try {
+        const data = await loadAppData()
+        if (ignore) return
+
+        if (data.patients.length) {
+          setPatients(data.patients)
+        }
+
+        if (data.users.length) {
+          setUsers(data.users)
+        }
+
+        if (data.reports.length) {
+          const firstReport = data.reports[0]
+          setReports(data.reports)
+          setReport(firstReport)
+
+          const entriesResult = await loadReportEntries(firstReport.id)
+          if (!ignore) {
+            setReportEntries(entriesResult.entries)
+          }
+        }
+
+        if (!ignore) {
+          setMessage(data.source === 'supabase' ? 'Da ket noi Supabase.' : '')
+        }
+      } catch (error) {
+        if (!ignore) {
+          setMessage(`Loi tai du lieu Supabase: ${error.message}`)
+        }
+      }
+    }
+
+    loadInitialData()
+
+    return () => {
+      ignore = true
+    }
+  }, [])
+
   const reportEntryPayload = useMemo(() => {
     const patientById = new Map(patients.map((patient) => [patient.idbn, patient]))
     return reportEntries.map((entry) => {
@@ -1096,7 +1239,7 @@ export default function App() {
     setMessage('')
     try {
       const payload = {
-        id: report.id || crypto.randomUUID(),
+        id: isUuid(report.id) ? report.id : crypto.randomUUID(),
         report_date: report.date,
         block_name: report.block,
         department_name: report.department,
@@ -1144,18 +1287,35 @@ export default function App() {
     setMessage('')
   }
 
-  const openReport = (reportId, mode = 'form') => {
+  const openReport = async (reportId, mode = 'form') => {
     const selectedReport = reports.find((item) => item.id === reportId)
     if (!selectedReport) return
     setReport(selectedReport)
     setReportMode(mode)
     setMessage('')
+
+    try {
+      const result = await loadReportEntries(reportId)
+      if (result.source === 'supabase') {
+        setReportEntries(result.entries)
+      }
+    } catch (error) {
+      setMessage(`Loi tai chi tiet bao cao: ${error.message}`)
+    }
   }
 
-  const deleteReport = (reportId) => {
-    setReports((current) => current.filter((item) => item.id !== reportId))
-    if (report.id === reportId) {
-      setReportMode('list')
+  const deleteReport = async (reportId) => {
+    setMessage('')
+
+    try {
+      await deleteDutyReport(reportId)
+      setReports((current) => current.filter((item) => item.id !== reportId))
+      if (report.id === reportId) {
+        setReportMode('list')
+      }
+      setMessage(isSupabaseConfigured ? 'Da xoa bao cao tren Supabase.' : '')
+    } catch (error) {
+      setMessage(`Loi xoa bao cao: ${error.message}`)
     }
   }
 
