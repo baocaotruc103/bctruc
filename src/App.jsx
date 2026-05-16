@@ -332,10 +332,12 @@ function CaptureTextarea({ label, value, onChange }) {
 
 function CameraTextScanner({ onClose, onConfirm }) {
   const videoRef = useRef(null)
+  const imageRef = useRef(null)
   const canvasRef = useRef(null)
   const frameRef = useRef(null)
   const dragStartRef = useRef(null)
   const [stream, setStream] = useState(null)
+  const [capturedImage, setCapturedImage] = useState('')
   const [selection, setSelection] = useState(null)
   const [ocrText, setOcrText] = useState('')
   const [status, setStatus] = useState('Đang mở camera...')
@@ -353,7 +355,7 @@ function CameraTextScanner({ onClose, onConfirm }) {
         if (videoRef.current) {
           videoRef.current.srcObject = activeStream
         }
-        setStatus('Chạm và kéo trên khung camera để chọn vùng chữ cần quét.')
+        setStatus('Đưa vùng chữ vào khung rồi bấm Chụp ảnh.')
       } catch (error) {
         setStatus(`Không mở được camera: ${error.message}`)
       }
@@ -373,14 +375,12 @@ function CameraTextScanner({ onClose, onConfirm }) {
   }, [stream])
 
   const pointFromEvent = (event) => {
-    const video = videoRef.current
     const frame = frameRef.current
-    if (!video || !frame) return null
+    if (!frame) return null
 
     const rect = frame.getBoundingClientRect()
-    const videoRect = getVideoDisplayRect(video, frame)
-    const x = Math.max(videoRect.left, Math.min(event.clientX - rect.left, videoRect.left + videoRect.width))
-    const y = Math.max(videoRect.top, Math.min(event.clientY - rect.top, videoRect.top + videoRect.height))
+    const x = Math.max(0, Math.min(event.clientX - rect.left, rect.width))
+    const y = Math.max(0, Math.min(event.clientY - rect.top, rect.height))
 
     return {
       x,
@@ -389,6 +389,7 @@ function CameraTextScanner({ onClose, onConfirm }) {
   }
 
   const handlePointerDown = (event) => {
+    if (!capturedImage) return
     event.preventDefault()
     event.currentTarget.setPointerCapture?.(event.pointerId)
     const point = pointFromEvent(event)
@@ -398,7 +399,7 @@ function CameraTextScanner({ onClose, onConfirm }) {
   }
 
   const handlePointerMove = (event) => {
-    if (!dragStartRef.current) return
+    if (!capturedImage || !dragStartRef.current) return
     event.preventDefault()
     const point = pointFromEvent(event)
     if (!point) return
@@ -416,35 +417,60 @@ function CameraTextScanner({ onClose, onConfirm }) {
     event.currentTarget.releasePointerCapture?.(event.pointerId)
   }
 
-  const scanSelectedRegion = async () => {
+  const captureFrame = () => {
     const video = videoRef.current
     const canvas = canvasRef.current
-    const frame = frameRef.current
-    if (!video || !canvas || !frame) return
+    if (!video || !canvas) return
 
     if (!video.videoWidth || !video.videoHeight) {
       setStatus('Camera chưa sẵn sàng, vui lòng thử lại sau vài giây.')
       return
     }
 
-    setStatus('Đang quét chữ...')
-    const videoRect = getVideoDisplayRect(video, frame)
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+    const context = canvas.getContext('2d')
+    context.drawImage(video, 0, 0, canvas.width, canvas.height)
+    setCapturedImage(canvas.toDataURL('image/png'))
+    setSelection(null)
+    setOcrText('')
+    setStatus('Đã chụp ảnh. Chạm và kéo trên ảnh để crop vùng chữ cần OCR.')
+  }
+
+  const retakePhoto = () => {
+    setCapturedImage('')
+    setSelection(null)
+    setOcrText('')
+    setStatus('Đưa vùng chữ vào khung rồi bấm Chụp ảnh.')
+  }
+
+  const scanCroppedImage = async () => {
+    const image = imageRef.current
+    const canvas = canvasRef.current
+    const frame = frameRef.current
+    if (!image || !canvas || !frame || !capturedImage) return
+
+    if (!image.naturalWidth || !image.naturalHeight) {
+      setStatus('Ảnh chưa sẵn sàng, vui lòng thử lại sau vài giây.')
+      return
+    }
+
+    setStatus('Đang OCR vùng crop...')
+    const frameRect = frame.getBoundingClientRect()
     const selected = selection?.width > 12 && selection?.height > 12
       ? selection
-      : videoRect
+      : { x: 0, y: 0, width: frameRect.width, height: frameRect.height }
 
-    const sourceX = Math.max(0, selected.x - videoRect.left)
-    const sourceY = Math.max(0, selected.y - videoRect.top)
-    const scaleX = video.videoWidth / videoRect.width
-    const scaleY = video.videoHeight / videoRect.height
+    const scaleX = image.naturalWidth / frameRect.width
+    const scaleY = image.naturalHeight / frameRect.height
     canvas.width = Math.max(1, Math.round(selected.width * scaleX))
     canvas.height = Math.max(1, Math.round(selected.height * scaleY))
 
     const context = canvas.getContext('2d')
     context.drawImage(
-      video,
-      sourceX * scaleX,
-      sourceY * scaleY,
+      image,
+      selected.x * scaleX,
+      selected.y * scaleY,
       selected.width * scaleX,
       selected.height * scaleY,
       0,
@@ -468,7 +494,7 @@ function CameraTextScanner({ onClose, onConfirm }) {
         <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
           <div>
             <h3 className="text-base font-semibold text-slate-950">Quét chữ bằng camera</h3>
-            <p className="text-sm text-slate-500">Chọn vùng chứa chữ, bấm Quét, sau đó xác nhận để điền vào ô dữ liệu.</p>
+            <p className="text-sm text-slate-500">Chụp ảnh, crop vùng chứa chữ, sau đó OCR để điền vào ô dữ liệu.</p>
           </div>
           <button type="button" onClick={onClose} className="flex h-9 w-9 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100">
             <X size={18} />
@@ -484,7 +510,16 @@ function CameraTextScanner({ onClose, onConfirm }) {
             onPointerCancel={handlePointerUp}
             onPointerLeave={handlePointerUp}
           >
-            <video ref={videoRef} autoPlay playsInline muted className="pointer-events-none max-h-[62vh] min-h-[320px] w-full object-contain" />
+            {capturedImage ? (
+              <img
+                ref={imageRef}
+                src={capturedImage}
+                alt="Ảnh đã chụp để crop OCR"
+                className="pointer-events-none max-h-[62vh] min-h-[320px] w-full object-contain"
+              />
+            ) : (
+              <video ref={videoRef} autoPlay playsInline muted className="pointer-events-none max-h-[62vh] min-h-[320px] w-full object-contain" />
+            )}
             {selection && (
               <div
                 className="pointer-events-none absolute border-2 border-hospital-500 bg-hospital-500/10"
@@ -499,14 +534,35 @@ function CameraTextScanner({ onClose, onConfirm }) {
           </div>
           <div className="flex flex-col gap-3">
             <p className="rounded-md bg-slate-50 p-3 text-sm text-slate-600">{status}</p>
-            <button
-              type="button"
-              onClick={scanSelectedRegion}
-              className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-hospital-600 px-4 text-sm font-semibold text-white hover:bg-hospital-700"
-            >
-              <ScanText size={16} />
-              Quét vùng đã chọn
-            </button>
+            {capturedImage ? (
+              <div className="grid gap-2">
+                <button
+                  type="button"
+                  onClick={scanCroppedImage}
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-hospital-600 px-4 text-sm font-semibold text-white hover:bg-hospital-700"
+                >
+                  <ScanText size={16} />
+                  OCR vùng crop
+                </button>
+                <button
+                  type="button"
+                  onClick={retakePhoto}
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-slate-200 px-4 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                >
+                  <Camera size={16} />
+                  Chụp lại
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={captureFrame}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-hospital-600 px-4 text-sm font-semibold text-white hover:bg-hospital-700"
+              >
+                <Camera size={16} />
+                Chụp ảnh
+              </button>
+            )}
             <textarea
               className="field-textarea min-h-[180px]"
               value={ocrText}
