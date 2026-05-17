@@ -76,6 +76,13 @@ export const initialUsers = [
     password: '123456',
     role: 'Trực chỉ huy',
   },
+  {
+    fullName: 'Phạm Đức Thắng',
+    unit: 'A01 Nội tim mạch',
+    username: 'pdthang',
+    password: '123456',
+    role: 'Khoa báo cáo',
+  },
 ]
 
 export const defaultReportMeta = {
