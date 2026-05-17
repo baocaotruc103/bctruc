@@ -4,6 +4,7 @@ const REPORTS_TABLE = 'duty_reports'
 const PATIENT_DIRECTORY_TABLE = 'patients'
 const PATIENTS_TABLE = 'duty_report_patients'
 const USERS_TABLE = 'app_users'
+const DEPARTMENT_UNITS_TABLE = 'department_units'
 
 function mapReportFromDb(row) {
   return {
@@ -57,11 +58,24 @@ function mapUserFromDb(row) {
   }
 }
 
+function mapDepartmentUnitFromDb(row) {
+  return {
+    id: row.id,
+    unitCode: row.unit_code || '',
+    unitName: row.unit_name || '',
+    blockName: row.block_name || '',
+    unitType: row.unit_type || 'Khoa',
+    isActive: row.is_active ?? true,
+    displayOrder: row.display_order || 0,
+  }
+}
+
 function mapReportEntryFromDb(row) {
   return {
     id: row.id,
     idbn: row.idbn || '',
     category: row.category || 'Theo doi',
+    progressDate: row.progress_date || '',
     clinicalProgress: row.clinical_progress || '',
     paraclinical: row.paraclinical || '',
     intervention: row.intervention || '',
@@ -71,10 +85,10 @@ function mapReportEntryFromDb(row) {
 
 export async function loadAppData() {
   if (!supabaseClient) {
-    return { source: 'local', reports: [], patients: [], users: [] }
+    return { source: 'local', reports: [], patients: [], users: [], catalogUnits: [] }
   }
 
-  const [reportsResult, patientsResult, usersResult] = await Promise.all([
+  const [reportsResult, patientsResult, usersResult, departmentUnitsResult] = await Promise.all([
     supabaseClient
       .from(REPORTS_TABLE)
       .select('*')
@@ -88,6 +102,11 @@ export async function loadAppData() {
       .from(USERS_TABLE)
       .select('*')
       .order('full_name', { ascending: true }),
+    supabaseClient
+      .from(DEPARTMENT_UNITS_TABLE)
+      .select('*')
+      .order('display_order', { ascending: true })
+      .order('unit_name', { ascending: true }),
   ])
 
   if (reportsResult.error) throw reportsResult.error
@@ -99,7 +118,57 @@ export async function loadAppData() {
     reports: reportsResult.data.map(mapReportFromDb),
     patients: patientsResult.data.map(mapPatientFromDb),
     users: usersResult.data.map(mapUserFromDb),
+    catalogUnits: departmentUnitsResult.error ? [] : departmentUnitsResult.data.map(mapDepartmentUnitFromDb),
   }
+}
+
+export async function saveDepartmentUnits(units) {
+  const normalizedUnits = (units || [])
+    .filter((unit) => unit.unitCode && unit.unitName)
+    .map((unit, index) => ({
+      unit_code: unit.unitCode,
+      unit_name: unit.unitName,
+      block_name: unit.blockName || '',
+      unit_type: unit.unitType || 'Khoa',
+      is_active: unit.isActive ?? true,
+      display_order: Number(unit.displayOrder) || (index + 1) * 10,
+      updated_at: new Date().toISOString(),
+    }))
+
+  if (!supabaseClient) {
+    localStorage.setItem('bc-truc-department-units', JSON.stringify(units || []))
+    return { source: 'local' }
+  }
+
+  const { data: existingRows, error: existingError } = await supabaseClient
+    .from(DEPARTMENT_UNITS_TABLE)
+    .select('unit_code')
+
+  if (existingError) throw existingError
+
+  const nextCodes = new Set(normalizedUnits.map((unit) => unit.unit_code))
+  const removedCodes = (existingRows || [])
+    .map((unit) => unit.unit_code)
+    .filter((unitCode) => !nextCodes.has(unitCode))
+
+  if (removedCodes.length) {
+    const { error: deleteError } = await supabaseClient
+      .from(DEPARTMENT_UNITS_TABLE)
+      .delete()
+      .in('unit_code', removedCodes)
+
+    if (deleteError) throw deleteError
+  }
+
+  if (normalizedUnits.length) {
+    const { error: upsertError } = await supabaseClient
+      .from(DEPARTMENT_UNITS_TABLE)
+      .upsert(normalizedUnits, { onConflict: 'unit_code' })
+
+    if (upsertError) throw upsertError
+  }
+
+  return { source: 'supabase' }
 }
 
 export async function loadReportEntries(reportId) {
@@ -188,6 +257,26 @@ export async function saveDutyReport(payload) {
       .upsert(userRows, { onConflict: 'username' })
 
     if (usersError) throw usersError
+  }
+
+  const nextUsernames = new Set((users || []).map((user) => user.username).filter(Boolean))
+  const { data: existingUsers, error: existingUsersError } = await supabaseClient
+    .from(USERS_TABLE)
+    .select('username')
+
+  if (existingUsersError) throw existingUsersError
+
+  const removedUsernames = (existingUsers || [])
+    .map((user) => user.username)
+    .filter((username) => !nextUsernames.has(username))
+
+  if (removedUsernames.length) {
+    const { error: deleteUsersError } = await supabaseClient
+      .from(USERS_TABLE)
+      .delete()
+      .in('username', removedUsernames)
+
+    if (deleteUsersError) throw deleteUsersError
   }
 
   const { error: deletePatientsError } = await supabaseClient

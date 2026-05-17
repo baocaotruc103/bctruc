@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Activity,
   Camera,
   Check,
   ClipboardCheck,
@@ -33,48 +32,50 @@ import {
   deleteDutyReport,
   loadAppData,
   loadReportEntries,
+  saveDepartmentUnits,
   saveDutyReport,
 } from './services/reportService'
-
-const patientTemplate = {
-  idbn: '',
-  fullName: '',
-  birthYear: '',
-  admissionDate: '',
-  departmentDate: '',
-  transferTo: '',
-  transferOutDate: '',
-  outcome: 'Đang điều trị',
-  outcomeDate: '',
-  diagnosis: '',
-  history: '',
-}
 
 const reportEntryTemplate = {
   idbn: '',
   category: 'Theo dõi',
+  progressDate: todayISO(),
   clinicalProgress: '',
   paraclinical: '',
   intervention: '',
   note: '',
 }
 
-const userTemplate = {
-  fullName: '',
-  unit: '',
-  username: '',
-  password: '',
-  role: 'Khoa báo cáo',
-}
-
 const navItems = [
-  { key: 'department-report', label: 'Báo cáo khoa', icon: ClipboardCheck },
   { key: 'patient-list', label: 'Danh sách BN', icon: ListChecks },
-  { key: 'users', label: 'User', icon: UserCog },
+  { key: 'department-report', label: 'Báo cáo khoa', icon: ClipboardCheck },
   { key: 'block-report', label: 'Báo cáo khối', icon: Layers },
   { key: 'command-report', label: 'Trực chỉ huy', icon: ShieldCheck },
+  { key: 'users', label: 'User', icon: UserCog },
   { key: 'catalog', label: 'Danh mục', icon: Database },
 ]
+
+function buildInitialCatalogUnits(users = initialUsers) {
+  const unitNames = Array.from(new Set([
+    ...departments,
+    ...users.map((user) => user.unit).filter(Boolean),
+  ]))
+
+  return unitNames.map((unitName, index) => {
+    const codeMatch = unitName.match(/^[A-Z]+\d*/)
+    const unitCode = codeMatch?.[0] || unitName.replace(/\s+/g, '-').toUpperCase()
+    const isDepartment = /^[A-Z]\d+/.test(unitCode)
+    return {
+      id: crypto.randomUUID(),
+      unitCode,
+      unitName,
+      blockName: '',
+      unitType: isDepartment ? 'Khoa' : 'Phòng',
+      isActive: true,
+      displayOrder: (index + 1) * 10,
+    }
+  })
+}
 
 function todayISO() {
   const now = new Date()
@@ -98,6 +99,22 @@ function computeDailyStats(patients, reportDate) {
     hospitalTransfers: patients.filter((patient) => patient.outcome === 'Chuyển viện' && patient.outcomeDate === reportDate).length,
     discharges: patients.filter((patient) => patient.outcome === 'Ra viện' && patient.outcomeDate === reportDate).length,
   }
+}
+
+function daysBetweenISO(fromDate, toDate) {
+  if (!fromDate || !toDate) return Number.POSITIVE_INFINITY
+  const from = new Date(`${fromDate}T00:00:00`)
+  const to = new Date(`${toDate}T00:00:00`)
+  return Math.floor((to - from) / 86400000)
+}
+
+function isPatientEligibleForDepartmentReport(patient, reportDate) {
+  if (!patient) return false
+  if (!patient.outcome || patient.outcome === 'Đang điều trị') return true
+
+  const endDate = patient.outcomeDate || patient.transferOutDate
+  const diff = daysBetweenISO(endDate, reportDate)
+  return diff >= 0 && diff <= 3
 }
 
 function buildReportDraft(baseReport, patients, loggedInUser) {
@@ -674,34 +691,17 @@ function AppShell({ activeMenu, onMenuChange, children }) {
   )
 }
 
-function TopBar({ report, activeMenu, saveState, onSave }) {
+function TopBar({ report, activeMenu }) {
   const activeLabel = navItems.find((item) => item.key === activeMenu)?.label || 'Báo cáo khoa'
 
   return (
     <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur">
-      <div className="flex min-h-16 flex-col gap-3 px-4 py-3 md:flex-row md:items-center md:justify-between lg:px-8">
+      <div className="flex min-h-16 flex-col gap-1 px-4 py-3 lg:px-8">
         <div>
           <h1 className="text-xl font-semibold tracking-normal text-slate-950">{activeLabel}</h1>
           <p className="text-sm text-slate-500">
-            {report.department} · {report.block} · Ngày {report.date}
+            {report.department} · {report.block} · Ngày {formatDateVN(report.date)}
           </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="inline-flex h-9 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-600">
-            <Activity size={16} className="text-hospital-600" />
-            Ca trực đang mở
-          </span>
-          <span className="inline-flex h-9 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-600">
-            <Database size={16} className={isSupabaseConfigured ? 'text-hospital-600' : 'text-amber-600'} />
-            {isSupabaseConfigured ? 'Supabase đã cấu hình' : 'Lưu nháp local'}
-          </span>
-          <button
-            onClick={onSave}
-            className="inline-flex h-9 items-center gap-2 rounded-md bg-hospital-600 px-4 text-sm font-semibold text-white hover:bg-hospital-700"
-          >
-            <Save size={16} />
-            {saveState === 'saving' ? 'Đang lưu' : 'Lưu báo cáo'}
-          </button>
         </div>
       </div>
     </header>
@@ -733,7 +733,7 @@ function DepartmentReportList({ reports, onCreate, onView, onEdit, onDelete }) {
           <tbody>
             {reports.map((item) => (
               <tr key={item.id} className="hover:bg-slate-50/70">
-                <td className="border-b border-slate-100 px-3 py-3 font-medium text-slate-900">{item.date}</td>
+                <td className="border-b border-slate-100 px-3 py-3 font-medium text-slate-900">{formatDateVN(item.date)}</td>
                 <td className="border-b border-slate-100 px-3 py-3">{item.doctor}</td>
                 <td className="border-b border-slate-100 px-3 py-3">{item.nurse}</td>
                 <td className="border-b border-slate-100 px-3 py-3">
@@ -848,93 +848,633 @@ function SummaryPanel({ report, setReport }) {
   )
 }
 
-function PatientDirectory({ patients, setPatients }) {
-  const updatePatient = (index, field, value) => {
+function PatientDirectory({ patients, setPatients, reportEntries, setReportEntries }) {
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [showAddForm, setShowAddForm] = useState(false)
+  const [viewPatient, setViewPatient] = useState(null)
+  const [progressPatient, setProgressPatient] = useState(null)
+  const [progressDraft, setProgressDraft] = useState({
+    category: 'Theo dõi',
+    progressDate: todayISO(),
+    clinicalProgress: '',
+    paraclinical: '',
+    intervention: '',
+    note: '',
+  })
+  const [patientDraft, setPatientDraft] = useState({
+    idbn: '',
+    fullName: '',
+    birthYear: '',
+    admissionDate: '',
+    departmentDate: '',
+    transferTo: '',
+    transferOutDate: '',
+    outcome: 'Đang điều trị',
+    outcomeDate: '',
+    diagnosis: '',
+    history: '',
+  })
+  const [editPatientIndex, setEditPatientIndex] = useState(null)
+  const [editPatientDraft, setEditPatientDraft] = useState(null)
+  const statusOptions = useMemo(() => {
+    const statuses = patients
+      .map((patient) => patient.outcome)
+      .filter(Boolean)
+    return Array.from(new Set(statuses)).sort((a, b) => a.localeCompare(b, 'vi'))
+  }, [patients])
+  const filteredPatients = useMemo(() => {
+    if (statusFilter === 'all') return patients
+    return patients.filter((patient) => patient.outcome === statusFilter)
+  }, [patients, statusFilter])
+  const viewPatientJournal = useMemo(() => {
+    if (!viewPatient) return []
+    return [...(reportEntries || [])]
+      .filter((entry) => entry.idbn === viewPatient.idbn)
+      .sort((first, second) => (second.progressDate || '').localeCompare(first.progressDate || ''))
+  }, [reportEntries, viewPatient])
+
+  const openProgressModal = (patient) => {
+    setProgressPatient(patient)
+    setProgressDraft({
+      category: 'Theo dõi',
+      progressDate: todayISO(),
+      clinicalProgress: '',
+      paraclinical: '',
+      intervention: '',
+      note: '',
+    })
+  }
+  const updateProgressDraft = (field, value) => {
+    setProgressDraft((current) => ({ ...current, [field]: value }))
+  }
+  const saveProgress = () => {
+    if (!progressPatient) return
+    setReportEntries((current) => [
+      ...current,
+      {
+        ...reportEntryTemplate,
+        ...progressDraft,
+        id: crypto.randomUUID(),
+        idbn: progressPatient.idbn || '',
+        source: 'patient-progress',
+      },
+    ])
+    setProgressPatient(null)
+  }
+  const updatePatientDraft = (field, value) => {
+    setPatientDraft((current) => ({ ...current, [field]: value }))
+  }
+  const resetPatientDraft = () => {
+    setPatientDraft({
+      idbn: '',
+      fullName: '',
+      birthYear: '',
+      admissionDate: '',
+      departmentDate: '',
+      transferTo: '',
+      transferOutDate: '',
+      outcome: 'Đang điều trị',
+      outcomeDate: '',
+      diagnosis: '',
+      history: '',
+    })
+  }
+  const savePatient = () => {
+    if (!patientDraft.idbn || !patientDraft.fullName) return
+    setPatients((current) => [...current, patientDraft])
+    resetPatientDraft()
+    setShowAddForm(false)
+  }
+  const openPatientModal = (patient) => {
+    const patientIndex = patients.indexOf(patient)
+    setEditPatientIndex(patientIndex)
+    setEditPatientDraft({ ...patient })
+  }
+  const updateEditPatientDraft = (field, value) => {
+    setEditPatientDraft((current) => ({ ...current, [field]: value }))
+  }
+  const saveEditedPatient = () => {
+    if (editPatientIndex === null || !editPatientDraft) return
     setPatients((current) =>
-      current.map((patient, patientIndex) =>
-        patientIndex === index ? { ...patient, [field]: value } : patient,
+      current.map((patient, index) =>
+        index === editPatientIndex ? editPatientDraft : patient,
       ),
     )
+    setEditPatientIndex(null)
+    setEditPatientDraft(null)
   }
+  const displayValue = (value) => value || '-'
+  const displayDate = (value) => (value ? formatDateVN(value) : '-')
 
-  const addPatient = () => setPatients((current) => [...current, patientTemplate])
-  const removePatient = (index) => setPatients((current) => current.filter((_, patientIndex) => patientIndex !== index))
+  if (viewPatient) {
+    return (
+      <section className="rounded-lg border border-slate-200 bg-white shadow-panel">
+        <div className="flex flex-col gap-3 border-b border-slate-200 p-4 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h2 className="text-base font-semibold text-slate-950">Thông tin bệnh nhân</h2>
+            <p className="text-sm text-slate-500">{viewPatient.idbn} - {viewPatient.fullName}</p>
+          </div>
+          <button onClick={() => setViewPatient(null)} className="inline-flex h-9 items-center rounded-md border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+            Quay lại danh sách
+          </button>
+        </div>
+        <dl className="grid gap-4 p-4 text-sm md:grid-cols-2 lg:grid-cols-3">
+          <div>
+            <dt className="font-semibold text-slate-500">IDBN</dt>
+            <dd className="text-slate-900">{displayValue(viewPatient.idbn)}</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-slate-500">Họ và tên</dt>
+            <dd className="text-slate-900">{displayValue(viewPatient.fullName)}</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-slate-500">Năm sinh</dt>
+            <dd className="text-slate-900">{displayValue(viewPatient.birthYear)}</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-slate-500">Ngày vào viện</dt>
+            <dd className="text-slate-900">{displayDate(viewPatient.admissionDate)}</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-slate-500">Ngày vào khoa</dt>
+            <dd className="text-slate-900">{displayDate(viewPatient.departmentDate)}</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-slate-500">Khoa chuyển đến</dt>
+            <dd className="text-slate-900">{displayValue(viewPatient.transferTo)}</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-slate-500">Ngày chuyển đi</dt>
+            <dd className="text-slate-900">{displayDate(viewPatient.transferOutDate)}</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-slate-500">Trạng thái</dt>
+            <dd className="text-slate-900">{displayValue(viewPatient.outcome)}</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-slate-500">Ngày ra</dt>
+            <dd className="text-slate-900">{displayDate(viewPatient.outcomeDate)}</dd>
+          </div>
+          <div className="md:col-span-2 lg:col-span-3">
+            <dt className="font-semibold text-slate-500">Chẩn đoán</dt>
+            <dd className="text-slate-900">{displayValue(viewPatient.diagnosis)}</dd>
+          </div>
+          <div className="md:col-span-2 lg:col-span-3">
+            <dt className="font-semibold text-slate-500">Bệnh sử</dt>
+            <dd className="text-slate-900">{displayValue(viewPatient.history)}</dd>
+          </div>
+        </dl>
+        <div className="border-t border-slate-200 p-4">
+          <h3 className="text-sm font-semibold text-slate-950">Nhật ký diễn biến bệnh nhân</h3>
+          <div className="mt-3 space-y-3">
+            {viewPatientJournal.map((entry) => (
+              <div key={entry.id} className="rounded-md border border-slate-200 p-3 text-sm">
+                <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+                  <p className="font-semibold text-slate-900">{entry.category || 'Theo dõi'}</p>
+                  <p className="text-slate-500">{displayDate(entry.progressDate)}</p>
+                </div>
+                <dl className="mt-3 grid gap-3 md:grid-cols-2">
+                  <div>
+                    <dt className="font-semibold text-slate-500">Diễn biến lâm sàng</dt>
+                    <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.clinicalProgress)}</dd>
+                  </div>
+                  <div>
+                    <dt className="font-semibold text-slate-500">Cận lâm sàng</dt>
+                    <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.paraclinical)}</dd>
+                  </div>
+                  <div>
+                    <dt className="font-semibold text-slate-500">Can thiệp</dt>
+                    <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.intervention)}</dd>
+                  </div>
+                  <div>
+                    <dt className="font-semibold text-slate-500">Ghi chú</dt>
+                    <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.note)}</dd>
+                  </div>
+                </dl>
+              </div>
+            ))}
+            {!viewPatientJournal.length && (
+              <p className="rounded-md border border-dashed border-slate-200 px-3 py-4 text-center text-sm text-slate-500">
+                Chưa có diễn biến.
+              </p>
+            )}
+          </div>
+        </div>
+      </section>
+    )
+  }
 
   return (
     <section className="rounded-lg border border-slate-200 bg-white shadow-panel">
       <div className="flex flex-col gap-3 border-b border-slate-200 p-4 md:flex-row md:items-center md:justify-between">
         <div>
           <h2 className="text-base font-semibold text-slate-950">Danh sách bệnh nhân</h2>
-          <p className="text-sm text-slate-500">IDBN là khóa định danh dùng để chọn bệnh nhân khi lập báo cáo khoa.</p>
+          <p className="text-sm text-slate-500">Bảng chỉ xem thông tin bệnh nhân; chọn thêm diễn biến để đưa bệnh nhân vào báo cáo khoa.</p>
         </div>
-        <button onClick={addPatient} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
-          <Plus size={16} />
-          Thêm bệnh nhân
-        </button>
+        <div className="flex flex-col gap-3 md:flex-row md:items-end">
+          <label className="w-full md:w-64">
+            <span className="field-label">Lọc theo trạng thái</span>
+            <select className="field-input h-9" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+              <option value="all">Tất cả trạng thái</option>
+              {statusOptions.map((status) => (
+                <option key={status} value={status}>{status}</option>
+              ))}
+            </select>
+          </label>
+          <button onClick={() => setShowAddForm((current) => !current)} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
+            <Plus size={16} />
+            Thêm bệnh nhân
+          </button>
+        </div>
       </div>
+      {showAddForm && (
+        <div className="border-b border-slate-200 p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-slate-950">Nhập thông tin bệnh nhân</h3>
+            <button onClick={() => setShowAddForm(false)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100" aria-label="Đóng form thêm bệnh nhân">
+              <X size={16} />
+            </button>
+          </div>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <Field label="IDBN">
+              <input className="field-input" value={patientDraft.idbn} onChange={(event) => updatePatientDraft('idbn', event.target.value)} />
+            </Field>
+            <Field label="Họ và tên">
+              <input className="field-input" value={patientDraft.fullName} onChange={(event) => updatePatientDraft('fullName', event.target.value)} />
+            </Field>
+            <Field label="Năm sinh">
+              <input className="field-input" value={patientDraft.birthYear} onChange={(event) => updatePatientDraft('birthYear', event.target.value)} />
+            </Field>
+            <Field label="Ngày vào viện">
+              <input className="field-input" type="date" value={patientDraft.admissionDate} onChange={(event) => updatePatientDraft('admissionDate', event.target.value)} />
+            </Field>
+            <Field label="Ngày vào khoa">
+              <input className="field-input" type="date" value={patientDraft.departmentDate} onChange={(event) => updatePatientDraft('departmentDate', event.target.value)} />
+            </Field>
+            <Field label="Khoa chuyển đến">
+              <input className="field-input" value={patientDraft.transferTo} onChange={(event) => updatePatientDraft('transferTo', event.target.value)} />
+            </Field>
+            <Field label="Ngày chuyển đi">
+              <input className="field-input" type="date" value={patientDraft.transferOutDate} onChange={(event) => updatePatientDraft('transferOutDate', event.target.value)} />
+            </Field>
+            <Field label="Trạng thái">
+              <select className="field-input" value={patientDraft.outcome} onChange={(event) => updatePatientDraft('outcome', event.target.value)}>
+                <option>Đang điều trị</option>
+                <option>Xin về</option>
+                <option>Tử vong</option>
+                <option>Chuyển viện</option>
+                <option>Ra viện</option>
+              </select>
+            </Field>
+            <Field label="Ngày ra">
+              <input className="field-input" type="date" value={patientDraft.outcomeDate} onChange={(event) => updatePatientDraft('outcomeDate', event.target.value)} />
+            </Field>
+            <div className="md:col-span-2 xl:col-span-2">
+              <Field label="Chẩn đoán">
+                <textarea className="field-textarea min-h-[84px]" value={patientDraft.diagnosis} onChange={(event) => updatePatientDraft('diagnosis', event.target.value)} />
+              </Field>
+            </div>
+            <div className="md:col-span-2 xl:col-span-2">
+              <Field label="Bệnh sử">
+                <textarea className="field-textarea min-h-[84px]" value={patientDraft.history} onChange={(event) => updatePatientDraft('history', event.target.value)} />
+              </Field>
+            </div>
+          </div>
+          <div className="mt-4 flex justify-end">
+            <button onClick={savePatient} className="inline-flex h-9 items-center gap-2 rounded-md bg-hospital-600 px-4 text-sm font-semibold text-white hover:bg-hospital-700">
+              <Save size={16} />
+              Lưu bệnh nhân
+            </button>
+          </div>
+        </div>
+      )}
       <div className="overflow-x-auto">
-        <table className="min-w-[1500px] w-full border-collapse text-left text-sm">
+        <table className="min-w-[980px] w-full border-collapse border border-slate-200 text-left text-sm">
           <thead className="bg-slate-50 text-[12px] font-semibold uppercase tracking-normal text-slate-500">
             <tr>
-              {['IDBN', 'Họ và tên', 'Năm sinh', 'Ngày vào viện', 'Ngày vào khoa', 'Khoa chuyển đến', 'Ngày chuyển đi', 'Trạng thái', 'Ngày ra', 'Chẩn đoán', 'Bệnh sử', ''].map((heading) => (
-                <th key={heading} className="border-b border-slate-200 px-3 py-3">{heading}</th>
+              {['IDBN', 'Họ và tên', 'Năm sinh', 'Ngày vào viện', 'Ngày vào khoa', 'Trạng thái', ''].map((heading) => (
+                <th key={heading} className="border border-slate-200 px-3 py-3">{heading}</th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {patients.map((patient, index) => (
+            {filteredPatients.map((patient, index) => (
               <tr key={`${patient.idbn}-${index}`} className="align-top hover:bg-slate-50/70">
-                <td className="border-b border-slate-100 p-2"><input className="field-input h-9" value={patient.idbn} onChange={(event) => updatePatient(index, 'idbn', event.target.value)} /></td>
-                <td className="border-b border-slate-100 p-2"><input className="field-input h-9" value={patient.fullName} onChange={(event) => updatePatient(index, 'fullName', event.target.value)} /></td>
-                <td className="border-b border-slate-100 p-2"><input className="field-input h-9 w-24" value={patient.birthYear} onChange={(event) => updatePatient(index, 'birthYear', event.target.value)} /></td>
-                <td className="border-b border-slate-100 p-2"><input className="field-input h-9" type="date" value={patient.admissionDate} onChange={(event) => updatePatient(index, 'admissionDate', event.target.value)} /></td>
-                <td className="border-b border-slate-100 p-2"><input className="field-input h-9" type="date" value={patient.departmentDate} onChange={(event) => updatePatient(index, 'departmentDate', event.target.value)} /></td>
-                <td className="border-b border-slate-100 p-2"><input className="field-input h-9" value={patient.transferTo} onChange={(event) => updatePatient(index, 'transferTo', event.target.value)} /></td>
-                <td className="border-b border-slate-100 p-2"><input className="field-input h-9" type="date" value={patient.transferOutDate || ''} onChange={(event) => updatePatient(index, 'transferOutDate', event.target.value)} /></td>
-                <td className="border-b border-slate-100 p-2">
-                  <select className="field-input h-9" value={patient.outcome || 'Đang điều trị'} onChange={(event) => updatePatient(index, 'outcome', event.target.value)}>
-                    <option>Đang điều trị</option>
-                    <option>Xin về</option>
-                    <option>Tử vong</option>
-                    <option>Chuyển viện</option>
-                    <option>Ra viện</option>
-                  </select>
-                </td>
-                <td className="border-b border-slate-100 p-2"><input className="field-input h-9" type="date" value={patient.outcomeDate || ''} onChange={(event) => updatePatient(index, 'outcomeDate', event.target.value)} /></td>
-                <td className="border-b border-slate-100 p-2"><textarea className="field-textarea min-h-[64px]" value={patient.diagnosis} onChange={(event) => updatePatient(index, 'diagnosis', event.target.value)} /></td>
-                <td className="border-b border-slate-100 p-2"><textarea className="field-textarea min-h-[64px]" value={patient.history} onChange={(event) => updatePatient(index, 'history', event.target.value)} /></td>
-                <td className="border-b border-slate-100 p-2">
-                  <button onClick={() => removePatient(index)} className="flex h-9 w-9 items-center justify-center rounded-md text-slate-500 hover:bg-red-50 hover:text-red-600" aria-label="Xóa bệnh nhân">
-                    <Trash2 size={16} />
-                  </button>
+                <td className="border border-slate-200 px-3 py-2 font-medium text-slate-900">{displayValue(patient.idbn)}</td>
+                <td className="border border-slate-200 px-3 py-2 text-slate-900">{displayValue(patient.fullName)}</td>
+                <td className="border border-slate-200 px-3 py-2 text-slate-700">{displayValue(patient.birthYear)}</td>
+                <td className="border border-slate-200 px-3 py-2 text-slate-700">{displayDate(patient.admissionDate)}</td>
+                <td className="border border-slate-200 px-3 py-2 text-slate-700">{displayDate(patient.departmentDate)}</td>
+                <td className="border border-slate-200 px-3 py-2 text-slate-700">{displayValue(patient.outcome)}</td>
+                <td className="border border-slate-200 p-2">
+                  <div className="flex min-w-[330px] items-center gap-2">
+                    <button onClick={() => openProgressModal(patient)} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
+                      <Plus size={16} />
+                      Thêm diễn biến
+                    </button>
+                    <button onClick={() => setViewPatient(patient)} className="inline-flex h-9 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+                      <Eye size={16} />
+                      Xem
+                    </button>
+                    <button onClick={() => openPatientModal(patient)} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-white px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-50">
+                      <Pencil size={16} />
+                      Sửa
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
+            {!filteredPatients.length && (
+              <tr>
+                <td colSpan={7} className="border border-slate-200 px-3 py-6 text-center text-sm text-slate-500">
+                  Không có bệnh nhân phù hợp với trạng thái đã chọn.
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
+      {viewPatient && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/40 px-4">
+          <div className="w-full max-w-4xl rounded-lg bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-slate-200 p-4">
+              <div>
+                <h3 className="text-base font-semibold text-slate-950">Thông tin bệnh nhân</h3>
+                <p className="text-sm text-slate-500">{viewPatient.idbn} - {viewPatient.fullName}</p>
+              </div>
+              <button onClick={() => setViewPatient(null)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100" aria-label="Đóng modal xem bệnh nhân">
+                <X size={16} />
+              </button>
+            </div>
+            <dl className="grid gap-4 p-4 text-sm md:grid-cols-2 lg:grid-cols-3">
+              <div>
+                <dt className="font-semibold text-slate-500">IDBN</dt>
+                <dd className="text-slate-900">{displayValue(viewPatient.idbn)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Họ và tên</dt>
+                <dd className="text-slate-900">{displayValue(viewPatient.fullName)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Năm sinh</dt>
+                <dd className="text-slate-900">{displayValue(viewPatient.birthYear)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Ngày vào viện</dt>
+                <dd className="text-slate-900">{displayDate(viewPatient.admissionDate)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Ngày vào khoa</dt>
+                <dd className="text-slate-900">{displayDate(viewPatient.departmentDate)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Khoa chuyển đến</dt>
+                <dd className="text-slate-900">{displayValue(viewPatient.transferTo)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Ngày chuyển đi</dt>
+                <dd className="text-slate-900">{displayDate(viewPatient.transferOutDate)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Trạng thái</dt>
+                <dd className="text-slate-900">{displayValue(viewPatient.outcome)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Ngày ra</dt>
+                <dd className="text-slate-900">{displayDate(viewPatient.outcomeDate)}</dd>
+              </div>
+              <div className="md:col-span-2 lg:col-span-3">
+                <dt className="font-semibold text-slate-500">Chẩn đoán</dt>
+                <dd className="text-slate-900">{displayValue(viewPatient.diagnosis)}</dd>
+              </div>
+              <div className="md:col-span-2 lg:col-span-3">
+                <dt className="font-semibold text-slate-500">Bệnh sử</dt>
+                <dd className="text-slate-900">{displayValue(viewPatient.history)}</dd>
+              </div>
+            </dl>
+            <div className="border-t border-slate-200 p-4">
+              <h4 className="text-sm font-semibold text-slate-950">Nhật ký diễn biến bệnh nhân</h4>
+              <div className="mt-3 space-y-3">
+                {viewPatientJournal.map((entry) => (
+                  <div key={entry.id} className="rounded-md border border-slate-200 p-3 text-sm">
+                    <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+                      <p className="font-semibold text-slate-900">{entry.category || 'Theo dõi'}</p>
+                      <p className="text-slate-500">{displayDate(entry.progressDate)}</p>
+                    </div>
+                    <dl className="mt-3 grid gap-3 md:grid-cols-2">
+                      <div>
+                        <dt className="font-semibold text-slate-500">Diễn biến lâm sàng</dt>
+                        <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.clinicalProgress)}</dd>
+                      </div>
+                      <div>
+                        <dt className="font-semibold text-slate-500">Cận lâm sàng</dt>
+                        <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.paraclinical)}</dd>
+                      </div>
+                      <div>
+                        <dt className="font-semibold text-slate-500">Can thiệp</dt>
+                        <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.intervention)}</dd>
+                      </div>
+                      <div>
+                        <dt className="font-semibold text-slate-500">Ghi chú</dt>
+                        <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.note)}</dd>
+                      </div>
+                    </dl>
+                  </div>
+                ))}
+                {!viewPatientJournal.length && (
+                  <p className="rounded-md border border-dashed border-slate-200 px-3 py-4 text-center text-sm text-slate-500">
+                    Chưa có diễn biến.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {progressPatient && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/40 px-4">
+          <div className="max-h-[90vh] w-full max-w-4xl overflow-hidden rounded-lg bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-slate-200 p-4">
+              <div>
+                <h3 className="text-base font-semibold text-slate-950">Thêm diễn biến</h3>
+                <p className="text-sm text-slate-500">{progressPatient.idbn} - {progressPatient.fullName}</p>
+              </div>
+              <button onClick={() => setProgressPatient(null)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100" aria-label="Đóng modal thêm diễn biến">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="grid max-h-[65vh] gap-4 overflow-y-auto p-4 md:grid-cols-2">
+              <Field label="Ngày diễn biến">
+                <input className="field-input" type="date" value={progressDraft.progressDate} onChange={(event) => updateProgressDraft('progressDate', event.target.value)} />
+              </Field>
+              <Field label="Loại báo cáo">
+                <select className="field-input" value={progressDraft.category} onChange={(event) => updateProgressDraft('category', event.target.value)}>
+                  <option>Theo dõi</option>
+                  <option>Tử vong</option>
+                  <option>Nặng xin về</option>
+                  <option>Chuyển viện</option>
+                  <option>Phẫu thuật cấp cứu</option>
+                  <option>Can thiệp cấp cứu</option>
+                  <option>Bất thường</option>
+                </select>
+              </Field>
+              <Field label="Diễn biến lâm sàng">
+                <textarea className="field-textarea min-h-[120px]" value={progressDraft.clinicalProgress} onChange={(event) => updateProgressDraft('clinicalProgress', event.target.value)} />
+              </Field>
+              <Field label="Cận lâm sàng">
+                <textarea className="field-textarea min-h-[120px]" value={progressDraft.paraclinical} onChange={(event) => updateProgressDraft('paraclinical', event.target.value)} />
+              </Field>
+              <Field label="Can thiệp">
+                <textarea className="field-textarea min-h-[120px]" value={progressDraft.intervention} onChange={(event) => updateProgressDraft('intervention', event.target.value)} />
+              </Field>
+              <Field label="Ghi chú">
+                <textarea className="field-textarea min-h-[120px]" value={progressDraft.note} onChange={(event) => updateProgressDraft('note', event.target.value)} />
+              </Field>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-slate-200 p-4">
+              <button onClick={() => setProgressPatient(null)} className="inline-flex h-9 items-center rounded-md border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+                Hủy
+              </button>
+              <button onClick={saveProgress} className="inline-flex h-9 items-center gap-2 rounded-md bg-hospital-600 px-4 text-sm font-semibold text-white hover:bg-hospital-700">
+                <Save size={16} />
+                Lưu diễn biến
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {editPatientIndex !== null && editPatientDraft && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/40 px-4">
+          <div className="max-h-[90vh] w-full max-w-5xl overflow-hidden rounded-lg bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-slate-200 p-4">
+              <div>
+                <h3 className="text-base font-semibold text-slate-950">Sửa thông tin bệnh nhân</h3>
+                <p className="text-sm text-slate-500">{patients[editPatientIndex]?.idbn} - {patients[editPatientIndex]?.fullName}</p>
+              </div>
+              <button onClick={() => {
+                setEditPatientIndex(null)
+                setEditPatientDraft(null)
+              }} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100" aria-label="Đóng modal sửa bệnh nhân">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="grid max-h-[65vh] gap-4 overflow-y-auto p-4 md:grid-cols-2 xl:grid-cols-4">
+              <Field label="IDBN">
+                <input className="field-input" value={editPatientDraft.idbn} onChange={(event) => updateEditPatientDraft('idbn', event.target.value)} />
+              </Field>
+              <Field label="Họ và tên">
+                <input className="field-input" value={editPatientDraft.fullName} onChange={(event) => updateEditPatientDraft('fullName', event.target.value)} />
+              </Field>
+              <Field label="Năm sinh">
+                <input className="field-input" value={editPatientDraft.birthYear} onChange={(event) => updateEditPatientDraft('birthYear', event.target.value)} />
+              </Field>
+              <Field label="Ngày vào viện">
+                <input className="field-input" type="date" value={editPatientDraft.admissionDate} onChange={(event) => updateEditPatientDraft('admissionDate', event.target.value)} />
+              </Field>
+              <Field label="Ngày vào khoa">
+                <input className="field-input" type="date" value={editPatientDraft.departmentDate} onChange={(event) => updateEditPatientDraft('departmentDate', event.target.value)} />
+              </Field>
+              <Field label="Khoa chuyển đến">
+                <input className="field-input" value={editPatientDraft.transferTo} onChange={(event) => updateEditPatientDraft('transferTo', event.target.value)} />
+              </Field>
+              <Field label="Ngày chuyển đi">
+                <input className="field-input" type="date" value={editPatientDraft.transferOutDate || ''} onChange={(event) => updateEditPatientDraft('transferOutDate', event.target.value)} />
+              </Field>
+              <Field label="Trạng thái">
+                <select className="field-input" value={editPatientDraft.outcome || 'Đang điều trị'} onChange={(event) => updateEditPatientDraft('outcome', event.target.value)}>
+                  <option>Đang điều trị</option>
+                  <option>Xin về</option>
+                  <option>Tử vong</option>
+                  <option>Chuyển viện</option>
+                  <option>Ra viện</option>
+                </select>
+              </Field>
+              <Field label="Ngày ra">
+                <input className="field-input" type="date" value={editPatientDraft.outcomeDate || ''} onChange={(event) => updateEditPatientDraft('outcomeDate', event.target.value)} />
+              </Field>
+              <div className="md:col-span-2">
+                <Field label="Chẩn đoán">
+                  <textarea className="field-textarea min-h-[96px]" value={editPatientDraft.diagnosis || ''} onChange={(event) => updateEditPatientDraft('diagnosis', event.target.value)} />
+                </Field>
+              </div>
+              <div className="md:col-span-2">
+                <Field label="Bệnh sử">
+                  <textarea className="field-textarea min-h-[96px]" value={editPatientDraft.history || ''} onChange={(event) => updateEditPatientDraft('history', event.target.value)} />
+                </Field>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-slate-200 p-4">
+              <button onClick={() => {
+                setEditPatientIndex(null)
+                setEditPatientDraft(null)
+              }} className="inline-flex h-9 items-center rounded-md border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+                Hủy
+              </button>
+              <button onClick={saveEditedPatient} className="inline-flex h-9 items-center gap-2 rounded-md bg-hospital-600 px-4 text-sm font-semibold text-white hover:bg-hospital-700">
+                <Save size={16} />
+                Lưu bệnh nhân
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   )
 }
 
-function UserDirectory({ users, setUsers }) {
-  const updateUser = (index, field, value) => {
+function UserDirectory({ users, setUsers, onSave, saveState }) {
+  const [selectedIndex, setSelectedIndex] = useState(null)
+  const [panelMode, setPanelMode] = useState('view')
+  const displayValue = (value) => value || '-'
+  const displayPassword = (value) => (value ? '••••••' : '-')
+  const selectedUser = selectedIndex === null ? null : users[selectedIndex]
+
+  const openUser = (index, mode) => {
+    setSelectedIndex(index)
+    setPanelMode(mode)
+  }
+
+  const addUser = () => {
+    setUsers((current) => {
+      setSelectedIndex(current.length)
+      setPanelMode('edit')
+      return [
+        ...current,
+        {
+          fullName: '',
+          unit: '',
+          username: '',
+          password: '',
+          role: 'Khoa báo cáo',
+        },
+      ]
+    })
+  }
+
+  const updateUser = (field, value) => {
+    if (selectedIndex === null) return
     setUsers((current) =>
-      current.map((user, userIndex) =>
-        userIndex === index ? { ...user, [field]: value } : user,
+      current.map((user, index) =>
+        index === selectedIndex ? { ...user, [field]: value } : user,
       ),
     )
   }
 
-  const addUser = () => setUsers((current) => [...current, userTemplate])
-  const removeUser = (index) => setUsers((current) => current.filter((_, userIndex) => userIndex !== index))
+  const removeUser = (index) => {
+    setUsers((current) => current.filter((_, userIndex) => userIndex !== index))
+    setSelectedIndex((current) => {
+      if (current === null) return null
+      if (current === index) return null
+      return current > index ? current - 1 : current
+    })
+  }
 
   return (
     <section className="rounded-lg border border-slate-200 bg-white shadow-panel">
       <div className="flex flex-col gap-3 border-b border-slate-200 p-4 md:flex-row md:items-center md:justify-between">
         <div>
           <h2 className="text-base font-semibold text-slate-950">User</h2>
-          <p className="text-sm text-slate-500">Danh sách tài khoản theo họ tên, đơn vị, user, pass và vai trò.</p>
+          <p className="text-sm text-slate-500">Bảng chỉ xem danh sách tài khoản theo họ tên, đơn vị, user, pass và vai trò.</p>
         </div>
         <button onClick={addUser} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
           <Plus size={16} />
@@ -942,54 +1482,125 @@ function UserDirectory({ users, setUsers }) {
         </button>
       </div>
       <div className="overflow-x-auto">
-        <table className="min-w-[920px] w-full border-collapse text-left text-sm">
+        <table className="min-w-[920px] w-full border-collapse border border-slate-200 text-left text-sm">
           <thead className="bg-slate-50 text-[12px] font-semibold uppercase tracking-normal text-slate-500">
             <tr>
               {['Họ và tên', 'Đơn vị', 'User', 'Pass', 'Vai trò', ''].map((heading) => (
-                <th key={heading} className="border-b border-slate-200 px-3 py-3">{heading}</th>
+                <th key={heading} className="border border-slate-200 px-3 py-3">{heading}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {users.map((user, index) => (
               <tr key={`${user.username}-${index}`} className="align-top hover:bg-slate-50/70">
-                <td className="border-b border-slate-100 p-2">
-                  <input className="field-input h-9" value={user.fullName} onChange={(event) => updateUser(index, 'fullName', event.target.value)} />
+                <td className="border border-slate-200 px-3 py-2 font-medium text-slate-900">{displayValue(user.fullName)}</td>
+                <td className="border border-slate-200 px-3 py-2 text-slate-700">{displayValue(user.unit)}</td>
+                <td className="border border-slate-200 px-3 py-2 text-slate-900">{displayValue(user.username)}</td>
+                <td className="border border-slate-200 px-3 py-2 text-slate-700">{displayPassword(user.password)}</td>
+                <td className="border border-slate-200 px-3 py-2 text-slate-700">{displayValue(user.role)}</td>
+                <td className="border border-slate-200 p-2">
+                  <div className="flex min-w-[230px] items-center gap-2">
+                    <button onClick={() => openUser(index, 'view')} className="inline-flex h-9 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+                      <Eye size={16} />
+                      Xem
+                    </button>
+                    <button onClick={() => openUser(index, 'edit')} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-white px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-50">
+                      <Pencil size={16} />
+                      Sửa
+                    </button>
+                    <button onClick={() => removeUser(index)} className="inline-flex h-9 items-center gap-2 rounded-md border border-red-100 bg-white px-3 text-sm font-semibold text-red-600 hover:bg-red-50">
+                      <Trash2 size={16} />
+                      Xóa
+                    </button>
+                  </div>
                 </td>
-                <td className="border-b border-slate-100 p-2">
-                  <input className="field-input h-9" value={user.unit} onChange={(event) => updateUser(index, 'unit', event.target.value)} />
+              </tr>
+            ))}
+            {!users.length && (
+              <tr>
+                <td colSpan={6} className="border border-slate-200 px-3 py-6 text-center text-sm text-slate-500">
+                  Chưa có user.
                 </td>
-                <td className="border-b border-slate-100 p-2">
-                  <input className="field-input h-9" value={user.username} onChange={(event) => updateUser(index, 'username', event.target.value)} />
-                </td>
-                <td className="border-b border-slate-100 p-2">
-                  <input className="field-input h-9" type="password" value={user.password} onChange={(event) => updateUser(index, 'password', event.target.value)} />
-                </td>
-                <td className="border-b border-slate-100 p-2">
-                  <select className="field-input h-9" value={user.role} onChange={(event) => updateUser(index, 'role', event.target.value)}>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {selectedUser && (
+        <div className="border-t border-slate-200 p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-slate-950">
+              {panelMode === 'edit' ? 'Sửa user' : 'Thông tin user'}
+            </h3>
+            <button onClick={() => setSelectedIndex(null)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100" aria-label="Đóng">
+              <X size={16} />
+            </button>
+          </div>
+          {panelMode === 'view' ? (
+            <dl className="grid gap-3 text-sm md:grid-cols-2 lg:grid-cols-3">
+              <div>
+                <dt className="font-semibold text-slate-500">Họ và tên</dt>
+                <dd className="text-slate-900">{displayValue(selectedUser.fullName)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Đơn vị</dt>
+                <dd className="text-slate-900">{displayValue(selectedUser.unit)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">User</dt>
+                <dd className="text-slate-900">{displayValue(selectedUser.username)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Pass</dt>
+                <dd className="text-slate-900">{displayValue(selectedUser.password)}</dd>
+              </div>
+              <div>
+                <dt className="font-semibold text-slate-500">Vai trò</dt>
+                <dd className="text-slate-900">{displayValue(selectedUser.role)}</dd>
+              </div>
+            </dl>
+          ) : (
+            <>
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                <Field label="Họ và tên">
+                  <input className="field-input" value={selectedUser.fullName} onChange={(event) => updateUser('fullName', event.target.value)} />
+                </Field>
+                <Field label="Đơn vị">
+                  <input className="field-input" value={selectedUser.unit} onChange={(event) => updateUser('unit', event.target.value)} />
+                </Field>
+                <Field label="User">
+                  <input className="field-input" value={selectedUser.username} onChange={(event) => updateUser('username', event.target.value)} />
+                </Field>
+                <Field label="Pass">
+                  <input className="field-input" type="password" value={selectedUser.password} onChange={(event) => updateUser('password', event.target.value)} />
+                </Field>
+                <Field label="Vai trò">
+                  <select className="field-input" value={selectedUser.role} onChange={(event) => updateUser('role', event.target.value)}>
                     <option>Khoa báo cáo</option>
                     <option>Trực khối</option>
                     <option>Trực chỉ huy</option>
                     <option>Quản trị</option>
                   </select>
-                </td>
-                <td className="border-b border-slate-100 p-2">
-                  <button onClick={() => removeUser(index)} className="flex h-9 w-9 items-center justify-center rounded-md text-slate-500 hover:bg-red-50 hover:text-red-600" aria-label="Xóa user">
-                    <Trash2 size={16} />
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+                </Field>
+              </div>
+              <div className="mt-4 flex justify-end">
+                <button onClick={onSave} className="inline-flex h-9 items-center gap-2 rounded-md bg-hospital-600 px-4 text-sm font-semibold text-white hover:bg-hospital-700">
+                  <Save size={16} />
+                  {saveState === 'saving' ? 'Đang lưu' : 'Lưu user'}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </section>
   )
 }
 
 function formatDateVN(dateValue) {
   if (!dateValue) return '...............'
-  const [year, month, day] = dateValue.split('-')
+  const [year, month, day] = String(dateValue).slice(0, 10).split('-')
+  if (!year || !month || !day) return dateValue
   return `${day}/${month}/${year}`
 }
 
@@ -1049,16 +1660,18 @@ function DepartmentReportDetail({ report, patients, entries }) {
       watch: [],
     }
 
-    entries.forEach((entry) => {
+    entries
+      .filter((entry) => (!report.date || entry.progressDate === report.date) && entry.source !== 'patient-progress')
+      .forEach((entry) => {
       if (entry.category === 'Tử vong') result.deaths.push(entry)
       else if (entry.category === 'Nặng xin về') result.severeDischarge.push(entry)
       else if (entry.category === 'Phẫu thuật cấp cứu' || entry.category === 'Can thiệp cấp cứu') result.emergency.push(entry)
       else if (entry.category === 'Bất thường') result.severeProgress.push(entry)
       else result.watch.push(entry)
-    })
+      })
 
     return result
-  }, [entries])
+  }, [entries, report.date])
 
   const reportDate = report.date ? new Date(`${report.date}T00:00:00`) : null
 
@@ -1107,8 +1720,36 @@ function DepartmentReportDetail({ report, patients, entries }) {
   )
 }
 
-function DepartmentReportEntries({ patients, entries, setEntries }) {
+function DepartmentReportEntries({ patients, entries, setEntries, reportDate }) {
   const patientById = useMemo(() => new Map(patients.map((patient) => [patient.idbn, patient])), [patients])
+  const eligiblePatients = useMemo(
+    () => patients.filter((patient) => isPatientEligibleForDepartmentReport(patient, reportDate || todayISO())),
+    [patients, reportDate],
+  )
+  const progressByPatientId = useMemo(() => {
+    const targetDate = reportDate || todayISO()
+    return entries.reduce((result, entry) => {
+      if (entry.idbn && entry.progressDate === targetDate && !entry.isReportSelection && !result.has(entry.idbn)) {
+        result.set(entry.idbn, entry)
+      }
+      return result
+    }, new Map())
+  }, [entries, reportDate])
+  const selectablePatients = useMemo(
+    () => eligiblePatients.filter((patient) => progressByPatientId.has(patient.idbn)),
+    [eligiblePatients, progressByPatientId],
+  )
+  const reportRows = useMemo(
+    () => entries.filter((entry) =>
+      entry.progressDate === (reportDate || todayISO())
+      && (entry.isReportSelection || (entry.idbn && entry.source !== 'patient-progress')),
+    ),
+    [entries, reportDate],
+  )
+  const unselectedPatients = useMemo(() => {
+    const selectedIds = new Set(reportRows.map((entry) => entry.idbn))
+    return selectablePatients.filter((patient) => !selectedIds.has(patient.idbn))
+  }, [reportRows, selectablePatients])
 
   const updateEntry = (index, field, value) => {
     setEntries((current) =>
@@ -1118,11 +1759,40 @@ function DepartmentReportEntries({ patients, entries, setEntries }) {
     )
   }
 
-  const addEntry = () =>
+  const addEntry = () => {
     setEntries((current) => [
       ...current,
-      { ...reportEntryTemplate, id: crypto.randomUUID(), idbn: patients[0]?.idbn || '' },
+      {
+        ...reportEntryTemplate,
+        id: crypto.randomUUID(),
+        idbn: '',
+        progressDate: reportDate || todayISO(),
+        isReportSelection: true,
+      },
     ])
+  }
+
+  const selectPatient = (index, idbn) => {
+    const selectedProgress = progressByPatientId.get(idbn)
+    if (!selectedProgress) {
+      updateEntry(index, 'idbn', idbn)
+      return
+    }
+    setEntries((current) =>
+      current.map((entry, entryIndex) =>
+        entryIndex === index
+          ? {
+              ...selectedProgress,
+              id: entry.id || crypto.randomUUID(),
+              idbn,
+              progressDate: reportDate || todayISO(),
+              isReportSelection: true,
+              source: 'department-report',
+            }
+          : entry,
+      ),
+    )
+  }
 
   const removeEntry = (index) => setEntries((current) => current.filter((_, entryIndex) => entryIndex !== index))
 
@@ -1131,44 +1801,45 @@ function DepartmentReportEntries({ patients, entries, setEntries }) {
       <div className="flex flex-col gap-3 border-b border-slate-200 p-4 md:flex-row md:items-center md:justify-between">
         <div>
           <h2 className="text-base font-semibold text-slate-950">Danh sách bệnh nhân báo cáo</h2>
-          <p className="text-sm text-slate-500">Chọn bệnh nhân từ Danh sách BN, sau đó ghi diễn biến lâm sàng, cận lâm sàng, can thiệp và ghi chú.</p>
+          <p className="text-sm text-slate-500">Chọn bệnh nhân đã có diễn biến trong Danh sách BN. Báo cáo tự lấy diễn biến có ngày trùng ngày báo cáo.</p>
         </div>
-        <button onClick={addEntry} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
+        <button onClick={addEntry} disabled={!unselectedPatients.length} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400">
           <Plus size={16} />
           Thêm bệnh nhân báo cáo
         </button>
       </div>
       <div className="divide-y divide-slate-100">
-        {entries.map((entry, index) => {
+        {reportRows.map((entry, index) => {
           const patient = patientById.get(entry.idbn)
+          const entryIndex = entries.indexOf(entry)
+          const selectPatients = patient && !selectablePatients.some((item) => item.idbn === patient.idbn)
+            ? [patient, ...selectablePatients]
+            : selectablePatients
           return (
             <div key={entry.id || index} className="grid gap-4 p-4 xl:grid-cols-[360px_1fr]">
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                 <div className="grid gap-3">
                   <Field label="Chọn bệnh nhân">
-                    <select className="field-input" value={entry.idbn} onChange={(event) => updateEntry(index, 'idbn', event.target.value)}>
+                    <select className="field-input" value={entry.idbn} onChange={(event) => selectPatient(entryIndex, event.target.value)}>
                       <option value="">Chọn theo IDBN - Họ tên</option>
-                      {patients.map((item) => (
+                      {selectPatients.map((item) => (
                         <option key={item.idbn} value={item.idbn}>
                           {item.idbn} - {item.fullName}
                         </option>
                       ))}
                     </select>
                   </Field>
-                  <Field label="Loại báo cáo">
-                    <select className="field-input" value={entry.category} onChange={(event) => updateEntry(index, 'category', event.target.value)}>
-                      <option>Theo dõi</option>
-                      <option>Tử vong</option>
-                      <option>Nặng xin về</option>
-                      <option>Chuyển viện</option>
-                      <option>Phẫu thuật cấp cứu</option>
-                      <option>Can thiệp cấp cứu</option>
-                      <option>Bất thường</option>
-                    </select>
-                  </Field>
                 </div>
                 {patient ? (
                   <dl className="mt-4 space-y-2 text-sm">
+                    <div>
+                      <dt className="font-semibold text-slate-500">Ngày diễn biến</dt>
+                      <dd className="text-slate-900">{formatDateVN(entry.progressDate)}</dd>
+                    </div>
+                    <div>
+                      <dt className="font-semibold text-slate-500">Loại báo cáo</dt>
+                      <dd className="text-slate-900">{entry.category || 'Theo dõi'}</dd>
+                    </div>
                     <div>
                       <dt className="font-semibold text-slate-500">Chẩn đoán</dt>
                       <dd className="text-slate-900">{patient.diagnosis}</dd>
@@ -1178,8 +1849,8 @@ function DepartmentReportEntries({ patients, entries, setEntries }) {
                       <dd className="text-slate-700">{patient.history}</dd>
                     </div>
                     <div className="grid grid-cols-2 gap-2 text-slate-600">
-                      <span>Vào viện: {patient.admissionDate}</span>
-                      <span>Vào khoa: {patient.departmentDate}</span>
+                      <span>Vào viện: {formatDateVN(patient.admissionDate)}</span>
+                      <span>Vào khoa: {formatDateVN(patient.departmentDate)}</span>
                     </div>
                   </dl>
                 ) : (
@@ -1187,24 +1858,24 @@ function DepartmentReportEntries({ patients, entries, setEntries }) {
                 )}
               </div>
               <div className="grid gap-4 md:grid-cols-2">
-                <CaptureTextarea
-                  label="Diễn biến lâm sàng"
-                  value={entry.clinicalProgress}
-                  onChange={(value) => updateEntry(index, 'clinicalProgress', value)}
-                />
-                <CaptureTextarea
-                  label="Cận lâm sàng"
-                  value={entry.paraclinical}
-                  onChange={(value) => updateEntry(index, 'paraclinical', value)}
-                />
-                <Field label="Can thiệp">
-                  <textarea className="field-textarea min-h-[104px]" value={entry.intervention} onChange={(event) => updateEntry(index, 'intervention', event.target.value)} />
-                </Field>
-                <Field label="Ghi chú">
-                  <textarea className="field-textarea min-h-[104px]" value={entry.note} onChange={(event) => updateEntry(index, 'note', event.target.value)} />
-                </Field>
+                <div>
+                  <p className="field-label">Diễn biến lâm sàng</p>
+                  <p className="min-h-[104px] rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-900">{entry.clinicalProgress || '-'}</p>
+                </div>
+                <div>
+                  <p className="field-label">Cận lâm sàng</p>
+                  <p className="min-h-[104px] rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-900">{entry.paraclinical || '-'}</p>
+                </div>
+                <div>
+                  <p className="field-label">Can thiệp</p>
+                  <p className="min-h-[104px] rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-900">{entry.intervention || '-'}</p>
+                </div>
+                <div>
+                  <p className="field-label">Ghi chú</p>
+                  <p className="min-h-[104px] rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-900">{entry.note || '-'}</p>
+                </div>
                 <div className="md:col-span-2">
-                  <button onClick={() => removeEntry(index)} className="inline-flex h-9 items-center gap-2 rounded-md px-3 text-sm font-semibold text-red-600 hover:bg-red-50">
+                  <button onClick={() => removeEntry(entryIndex)} className="inline-flex h-9 items-center gap-2 rounded-md px-3 text-sm font-semibold text-red-600 hover:bg-red-50">
                     <Trash2 size={16} />
                     Xóa khỏi báo cáo
                   </button>
@@ -1213,6 +1884,11 @@ function DepartmentReportEntries({ patients, entries, setEntries }) {
             </div>
           )
         })}
+        {!reportRows.length && (
+          <p className="px-4 py-6 text-center text-sm text-slate-500">
+            Bấm Thêm bệnh nhân báo cáo để chọn bệnh nhân có diễn biến trùng ngày báo cáo.
+          </p>
+        )}
       </div>
     </section>
   )
@@ -1272,11 +1948,110 @@ function PlaceholderView({ title }) {
   )
 }
 
+function CatalogView({ catalogUnits, setCatalogUnits }) {
+  const updateUnit = (index, field, value) => {
+    setCatalogUnits((current) =>
+      current.map((unit, unitIndex) =>
+        unitIndex === index ? { ...unit, [field]: value } : unit,
+      ),
+    )
+  }
+
+  const addUnit = () => {
+    setCatalogUnits((current) => [
+      ...current,
+      {
+        id: crypto.randomUUID(),
+        unitCode: '',
+        unitName: '',
+        blockName: '',
+        unitType: 'Khoa',
+        isActive: true,
+        displayOrder: (current.length + 1) * 10,
+      },
+    ])
+  }
+
+  const removeUnit = (index) => {
+    setCatalogUnits((current) => current.filter((_, unitIndex) => unitIndex !== index))
+  }
+
+  return (
+    <section className="rounded-lg border border-slate-200 bg-white shadow-panel">
+      <div className="flex flex-col gap-3 border-b border-slate-200 p-4 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h2 className="text-base font-semibold text-slate-950">Danh mục đơn vị</h2>
+          <p className="text-sm text-slate-500">Thêm, sửa hoặc xóa đơn vị rồi bấm Lưu để cập nhật Supabase.</p>
+        </div>
+        <button onClick={addUnit} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
+          <Plus size={16} />
+          Thêm đơn vị
+        </button>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="min-w-[1100px] w-full border-collapse border border-slate-200 text-left text-sm">
+          <thead className="bg-slate-50 text-[12px] font-semibold uppercase tracking-normal text-slate-500">
+            <tr>
+              {['Mã đơn vị', 'Tên đơn vị', 'Khối', 'Loại', 'Hoạt động', 'Thứ tự', ''].map((heading) => (
+                <th key={heading} className="border border-slate-200 px-3 py-3">{heading}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {catalogUnits.map((unit, index) => (
+              <tr key={unit.id || `${unit.unitCode}-${index}`} className="hover:bg-slate-50/70">
+                <td className="border border-slate-200 p-2">
+                  <input className="field-input h-9 w-28" value={unit.unitCode} onChange={(event) => updateUnit(index, 'unitCode', event.target.value.toUpperCase())} />
+                </td>
+                <td className="border border-slate-200 p-2">
+                  <input className="field-input h-9 min-w-64" value={unit.unitName} onChange={(event) => updateUnit(index, 'unitName', event.target.value)} />
+                </td>
+                <td className="border border-slate-200 p-2">
+                  <input className="field-input h-9 min-w-40" value={unit.blockName || ''} onChange={(event) => updateUnit(index, 'blockName', event.target.value)} />
+                </td>
+                <td className="border border-slate-200 p-2">
+                  <select className="field-input h-9 min-w-28" value={unit.unitType || 'Khoa'} onChange={(event) => updateUnit(index, 'unitType', event.target.value)}>
+                    <option>Khoa</option>
+                    <option>Phòng</option>
+                    <option>Khối</option>
+                    <option>Khác</option>
+                  </select>
+                </td>
+                <td className="border border-slate-200 p-2">
+                  <label className="flex h-9 items-center justify-center">
+                    <input type="checkbox" checked={unit.isActive ?? true} onChange={(event) => updateUnit(index, 'isActive', event.target.checked)} />
+                  </label>
+                </td>
+                <td className="border border-slate-200 p-2">
+                  <input className="field-input h-9 w-24" type="number" value={unit.displayOrder || 0} onChange={(event) => updateUnit(index, 'displayOrder', event.target.value)} />
+                </td>
+                <td className="border border-slate-200 p-2">
+                  <button onClick={() => removeUnit(index)} className="flex h-9 w-9 items-center justify-center rounded-md text-slate-500 hover:bg-red-50 hover:text-red-600" aria-label="Xóa đơn vị">
+                    <Trash2 size={16} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {!catalogUnits.length && (
+              <tr>
+                <td colSpan={7} className="border border-slate-200 px-3 py-6 text-center text-sm text-slate-500">
+                  Chưa có đơn vị trong danh mục.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  )
+}
+
 export default function App() {
-  const [activeMenu, setActiveMenu] = useState('department-report')
+  const [activeMenu, setActiveMenu] = useState('patient-list')
   const [patients, setPatients] = useState(initialPatientDirectory)
   const [reportEntries, setReportEntries] = useState(initialReportEntries)
   const [users, setUsers] = useState(initialUsers)
+  const [catalogUnits, setCatalogUnits] = useState(() => buildInitialCatalogUnits())
   const loggedInUser = users[0]
   const initialReport = useMemo(
     () => ({
@@ -1313,6 +2088,10 @@ export default function App() {
           setUsers(data.users)
         }
 
+        if (data.catalogUnits.length) {
+          setCatalogUnits(data.catalogUnits)
+        }
+
         if (data.reports.length) {
           const firstReport = data.reports[0]
           setReports(data.reports)
@@ -1325,7 +2104,7 @@ export default function App() {
         }
 
         if (!ignore) {
-          setMessage(data.source === 'supabase' ? 'Da ket noi Supabase.' : '')
+          setMessage('')
         }
       } catch (error) {
         if (!ignore) {
@@ -1343,7 +2122,9 @@ export default function App() {
 
   const reportEntryPayload = useMemo(() => {
     const patientById = new Map(patients.map((patient) => [patient.idbn, patient]))
-    return reportEntries.map((entry) => {
+    return reportEntries
+      .filter((entry) => (!report.date || entry.progressDate === report.date) && entry.source !== 'patient-progress')
+      .map((entry) => {
       const patient = patientById.get(entry.idbn) || {}
       return {
         idbn: entry.idbn,
@@ -1356,12 +2137,13 @@ export default function App() {
         history: patient.history || '',
         category: entry.category,
         clinical_progress: entry.clinicalProgress,
+        progress_date: entry.progressDate || report.date || todayISO(),
         paraclinical: entry.paraclinical,
         intervention: entry.intervention,
         note: entry.note,
       }
-    })
-  }, [patients, reportEntries])
+      })
+  }, [patients, reportEntries, report.date])
 
   const handleSave = async () => {
     setSaveState('saving')
@@ -1394,6 +2176,7 @@ export default function App() {
         patients: reportEntryPayload,
       }
       const result = await saveDutyReport(payload)
+      await saveDepartmentUnits(catalogUnits)
       setReports((current) => {
         const savedReport = { ...report, id: payload.id }
         return current.some((item) => item.id === savedReport.id)
@@ -1411,7 +2194,6 @@ export default function App() {
 
   const createReport = () => {
     setReport(buildReportDraft(defaultReportMeta, patients, loggedInUser))
-    setReportEntries([])
     setReportMode('form')
     setMessage('')
   }
@@ -1465,7 +2247,7 @@ export default function App() {
 
   return (
     <AppShell activeMenu={activeMenu} onMenuChange={setActiveMenu}>
-      <TopBar report={report} activeMenu={activeMenu} saveState={saveState} onSave={handleSave} />
+      <TopBar report={report} activeMenu={activeMenu} />
       <div className="space-y-5 px-4 py-5 lg:px-8">
         {message && (
           <div className="rounded-md border border-hospital-100 bg-hospital-50 px-4 py-3 text-sm font-medium text-hospital-700">
@@ -1510,21 +2292,26 @@ export default function App() {
                 <>
                   <ReportMetaForm report={report} setReport={setReport} patients={patients} />
                   <SummaryPanel report={report} setReport={setReport} />
-                  <DepartmentReportEntries patients={patients} entries={reportEntries} setEntries={setReportEntries} />
+                  <DepartmentReportEntries patients={patients} entries={reportEntries} setEntries={setReportEntries} reportDate={report.date} />
                 </>
               )}
             </>
           )
         )}
         {activeMenu === 'patient-list' && (
-          <PatientDirectory patients={patients} setPatients={setPatients} />
+          <PatientDirectory
+            patients={patients}
+            setPatients={setPatients}
+            reportEntries={reportEntries}
+            setReportEntries={setReportEntries}
+          />
         )}
         {activeMenu === 'users' && (
-          <UserDirectory users={users} setUsers={setUsers} />
+          <UserDirectory users={users} setUsers={setUsers} onSave={handleSave} saveState={saveState} />
         )}
         {activeMenu === 'block-report' && <AggregatedPreview report={report} patients={patients} entries={reportEntries} />}
         {activeMenu === 'command-report' && <AggregatedPreview report={report} patients={patients} entries={reportEntries} />}
-        {activeMenu === 'catalog' && <PlaceholderView title="Danh mục" />}
+        {activeMenu === 'catalog' && <CatalogView catalogUnits={catalogUnits} setCatalogUnits={setCatalogUnits} />}
       </div>
     </AppShell>
   )

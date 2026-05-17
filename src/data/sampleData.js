@@ -52,6 +52,7 @@ export const initialReportEntries = [
   {
     id: 'entry-001',
     idbn: '240515001',
+    progressDate: '2026-05-15',
     category: 'Theo dõi',
     clinicalProgress: 'SpO2 dao động 92-94% với oxy gọng kính 3 lít/phút.',
     paraclinical: 'BC 15 G/L, CRP tăng, X-quang phổi mờ đáy phải.',
