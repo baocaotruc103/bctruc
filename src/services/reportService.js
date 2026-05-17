@@ -3,6 +3,7 @@ import { supabaseClient } from '../lib/supabase'
 const REPORTS_TABLE = 'duty_reports'
 const PATIENT_DIRECTORY_TABLE = 'patients'
 const PATIENTS_TABLE = 'duty_report_patients'
+const PATIENT_PROGRESS_TABLE = 'patient_progress'
 const USERS_TABLE = 'app_users'
 const DEPARTMENT_UNITS_TABLE = 'department_units'
 
@@ -71,6 +72,12 @@ function mapDepartmentUnitFromDb(row) {
 }
 
 function mapReportEntryFromDb(row) {
+  const imageUrls = Array.isArray(row.image_urls)
+    ? row.image_urls
+    : row.image_url
+      ? [row.image_url]
+      : []
+
   return {
     id: row.id,
     idbn: row.idbn || '',
@@ -79,16 +86,40 @@ function mapReportEntryFromDb(row) {
     clinicalProgress: row.clinical_progress || '',
     paraclinical: row.paraclinical || '',
     intervention: row.intervention || '',
+    imageUrl: row.image_url || '',
+    imageUrls,
     note: row.note || '',
+  }
+}
+
+function mapPatientProgressFromDb(row) {
+  const imageUrls = Array.isArray(row.image_urls)
+    ? row.image_urls
+    : row.image_url
+      ? [row.image_url]
+      : []
+
+  return {
+    id: row.id,
+    idbn: row.idbn || '',
+    category: row.category || 'Theo dõi',
+    progressDate: row.progress_date || '',
+    clinicalProgress: row.clinical_progress || '',
+    paraclinical: row.paraclinical || '',
+    intervention: row.intervention || '',
+    imageUrl: row.image_url || '',
+    imageUrls,
+    note: row.note || '',
+    source: 'patient-progress',
   }
 }
 
 export async function loadAppData() {
   if (!supabaseClient) {
-    return { source: 'local', reports: [], patients: [], users: [], catalogUnits: [] }
+    return { source: 'local', reports: [], patients: [], users: [], catalogUnits: [], patientProgress: [] }
   }
 
-  const [reportsResult, patientsResult, usersResult, departmentUnitsResult] = await Promise.all([
+  const [reportsResult, patientsResult, usersResult, departmentUnitsResult, patientProgressResult] = await Promise.all([
     supabaseClient
       .from(REPORTS_TABLE)
       .select('*')
@@ -107,18 +138,26 @@ export async function loadAppData() {
       .select('*')
       .order('display_order', { ascending: true })
       .order('unit_name', { ascending: true }),
+    supabaseClient
+      .from(PATIENT_PROGRESS_TABLE)
+      .select('*')
+      .order('progress_date', { ascending: false })
+      .order('created_at', { ascending: false }),
   ])
 
   if (reportsResult.error) throw reportsResult.error
   if (patientsResult.error) throw patientsResult.error
   if (usersResult.error) throw usersResult.error
+  if (departmentUnitsResult.error) throw departmentUnitsResult.error
+  if (patientProgressResult.error) throw patientProgressResult.error
 
   return {
     source: 'supabase',
     reports: reportsResult.data.map(mapReportFromDb),
     patients: patientsResult.data.map(mapPatientFromDb),
     users: usersResult.data.map(mapUserFromDb),
-    catalogUnits: departmentUnitsResult.error ? [] : departmentUnitsResult.data.map(mapDepartmentUnitFromDb),
+    catalogUnits: departmentUnitsResult.data.map(mapDepartmentUnitFromDb),
+    patientProgress: patientProgressResult.data.map(mapPatientProgressFromDb),
   }
 }
 
@@ -187,8 +226,87 @@ export async function loadReportEntries(reportId) {
   return { source: 'supabase', entries: data.map(mapReportEntryFromDb) }
 }
 
+export async function upsertPatientDirectory(patient) {
+  if (!supabaseClient || !patient) {
+    // noop for local mode
+    return { source: 'local' }
+  }
+  function safeIso(value) {
+    if (!value) return null
+    // accept already ISO yyyy-mm-dd
+    if (/^\d{4}-\d{2}-\d{2}$/.test(String(value))) return value
+    // try parse
+    const d = new Date(String(value))
+    if (Number.isNaN(d.getTime())) return null
+    const year = d.getFullYear()
+    const month = String(d.getMonth() + 1).padStart(2, '0')
+    const day = String(d.getDate()).padStart(2, '0')
+    return `${year}-${month}-${day}`
+  }
+
+  const row = {
+    idbn: patient.idbn,
+    full_name: patient.fullName,
+    birth_year: Number(patient.birthYear) || null,
+    admission_date: safeIso(patient.admissionDate) || null,
+    department_date: safeIso(patient.departmentDate) || null,
+    transfer_to: patient.transferTo || '',
+    transfer_out_date: patient.transferOutDate || null,
+    outcome: patient.outcome,
+    outcome_date: patient.outcomeDate || null,
+    diagnosis: patient.diagnosis || '',
+    history: patient.history || '',
+    updated_at: new Date().toISOString(),
+  }
+
+  const { error } = await supabaseClient
+    .from(PATIENT_DIRECTORY_TABLE)
+    .upsert([row], { onConflict: 'idbn' })
+
+  if (error) throw error
+  return { source: 'supabase' }
+}
+
+export async function upsertPatientProgressEntry(entry) {
+  if (!supabaseClient || !entry) {
+    return { source: 'local' }
+  }
+
+  const imageUrls = Array.isArray(entry.imageUrls)
+    ? entry.imageUrls
+    : entry.imageUrl
+      ? [entry.imageUrl]
+      : []
+
+  const row = {
+    id: entry.id,
+    idbn: entry.idbn,
+    progress_date: entry.progressDate || null,
+    category: entry.category || 'Theo dõi',
+    clinical_progress: entry.clinicalProgress || '',
+    paraclinical: entry.paraclinical || '',
+    intervention: entry.intervention || '',
+    image_url: imageUrls[0] || '',
+    image_urls: imageUrls,
+    note: entry.note || '',
+    updated_at: new Date().toISOString(),
+  }
+
+  const { error } = await supabaseClient
+    .from(PATIENT_PROGRESS_TABLE)
+    .upsert([row], { onConflict: 'id' })
+
+  if (error) throw error
+  return { source: 'supabase' }
+}
+
 export async function deleteDutyReport(reportId) {
   if (!supabaseClient || !reportId) {
+    return { source: 'local' }
+  }
+
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(reportId)
+  if (!isUuid) {
     return { source: 'local' }
   }
 

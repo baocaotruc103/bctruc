@@ -9,6 +9,8 @@ import {
   Hospital,
   Layers,
   ListChecks,
+  Lock,
+  LogIn,
   Mic,
   Pencil,
   Plus,
@@ -17,6 +19,7 @@ import {
   ScanText,
   ShieldCheck,
   Trash2,
+  User,
   UserCog,
   X,
 } from 'lucide-react'
@@ -34,7 +37,10 @@ import {
   loadReportEntries,
   saveDepartmentUnits,
   saveDutyReport,
+  upsertPatientDirectory,
+  upsertPatientProgressEntry,
 } from './services/reportService'
+import { compressImageDataUrl, uploadProgressImagesToSupabase } from './services/supabaseImageService'
 
 const reportEntryTemplate = {
   idbn: '',
@@ -43,8 +49,18 @@ const reportEntryTemplate = {
   clinicalProgress: '',
   paraclinical: '',
   intervention: '',
+  imageUrl: '',
+  imageUrls: [],
   note: '',
 }
+
+const departmentReportSections = [
+  { key: 'deaths', title: 'Bệnh nhân tử vong', category: 'Tử vong', categories: ['Tử vong'] },
+  { key: 'severeDischarge', title: 'Bệnh nhân nặng xin về', category: 'Nặng xin về', categories: ['Nặng xin về'] },
+  { key: 'emergency', title: 'Bệnh nhân cấp cứu/Phẫu thuật/Phẫu thuật cấp cứu', category: 'Phẫu thuật cấp cứu', categories: ['Phẫu thuật cấp cứu', 'Can thiệp cấp cứu'] },
+  { key: 'admissions', title: 'Bệnh nhân vào viện', category: 'Vào viện', categories: ['Vào viện'] },
+  { key: 'watch', title: 'Bệnh nhân theo dõi', category: 'Theo dõi', categories: ['Theo dõi', 'Bất thường'] },
+]
 
 const navItems = [
   { key: 'patient-list', label: 'Danh sách BN', icon: ListChecks },
@@ -77,6 +93,42 @@ function buildInitialCatalogUnits(users = initialUsers) {
   })
 }
 
+function formatUnitOption(unit) {
+  const unitCode = unit?.unitCode?.trim()
+  const unitName = unit?.unitName?.trim()
+  if (!unitCode && !unitName) return ''
+  if (!unitCode) return unitName
+  if (!unitName) return unitCode
+
+  const normalizedName = unitName.replace(new RegExp(`^${unitCode}\\s*[-–—:]?\\s*`, 'i'), '').trim()
+  return `${unitCode} - ${normalizedName || unitName}`
+}
+
+function normalizeUnitText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[–—-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function resolveUserUnitInfo(user, catalogUnits = []) {
+  const userUnit = user?.unit || ''
+  const userUnitCode = userUnit.match(/^[A-Z]+\d*/i)?.[0]?.toUpperCase()
+  const normalizedUserUnit = normalizeUnitText(userUnit)
+  const matchedUnit = (catalogUnits || []).find((unit) => {
+    const unitCode = unit.unitCode?.toUpperCase()
+    return (userUnitCode && unitCode === userUnitCode)
+      || normalizeUnitText(unit.unitName) === normalizedUserUnit
+      || normalizeUnitText(formatUnitOption(unit)) === normalizedUserUnit
+  })
+
+  return {
+    block: matchedUnit?.blockName || '',
+    department: matchedUnit?.unitName || userUnit,
+  }
+}
+
 function todayISO() {
   const now = new Date()
   const year = now.getFullYear()
@@ -89,10 +141,28 @@ function isUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
 }
 
+const directAdmissionSourceCodes = new Set(['B15', 'B16'])
+
+function getUnitCode(value) {
+  return String(value || '').match(/[A-Z]\d{2,}/i)?.[0]?.toUpperCase() || ''
+}
+
+function isDirectAdmissionSource(patient) {
+  return directAdmissionSourceCodes.has(getUnitCode(patient?.transferTo))
+}
+
 function computeDailyStats(patients, reportDate) {
+  const enteredDepartmentToday = patients.filter((patient) => patient.departmentDate === reportDate || (!patient.departmentDate && patient.admissionDate === reportDate))
+
   return {
-    admissions: patients.filter((patient) => patient.admissionDate === reportDate).length,
-    transfersIn: patients.filter((patient) => patient.departmentDate === reportDate).length,
+    admissions: enteredDepartmentToday.filter((patient) => {
+      const sourceUnitCode = getUnitCode(patient.transferTo)
+      return isDirectAdmissionSource(patient) || (!sourceUnitCode && patient.admissionDate === reportDate)
+    }).length,
+    transfersIn: enteredDepartmentToday.filter((patient) => {
+      const sourceUnitCode = getUnitCode(patient.transferTo)
+      return (sourceUnitCode && !isDirectAdmissionSource(patient)) || (!sourceUnitCode && patient.departmentDate === reportDate && patient.admissionDate !== reportDate)
+    }).length,
     transfersOut: patients.filter((patient) => patient.transferOutDate === reportDate).length,
     severeDischarge: patients.filter((patient) => patient.outcome === 'Xin về' && patient.outcomeDate === reportDate).length,
     deaths: patients.filter((patient) => patient.outcome === 'Tử vong' && patient.outcomeDate === reportDate).length,
@@ -117,15 +187,17 @@ function isPatientEligibleForDepartmentReport(patient, reportDate) {
   return diff >= 0 && diff <= 3
 }
 
-function buildReportDraft(baseReport, patients, loggedInUser) {
+function buildReportDraft(baseReport, patients, loggedInUser, catalogUnits = []) {
   const reportDate = todayISO()
+  const userUnitInfo = resolveUserUnitInfo(loggedInUser, catalogUnits)
   return {
     ...baseReport,
     id: crypto.randomUUID(),
     date: reportDate,
     reporter: loggedInUser?.fullName || '',
-    department: loggedInUser?.unit || baseReport.department,
-    doctor: loggedInUser?.role === 'Khoa báo cáo' ? baseReport.doctor : loggedInUser?.fullName || baseReport.doctor,
+    block: userUnitInfo.block || baseReport.block,
+    department: userUnitInfo.department || baseReport.department,
+    doctor: loggedInUser?.fullName || baseReport.doctor,
     ...computeDailyStats(patients, reportDate),
   }
 }
@@ -136,6 +208,95 @@ function Field({ label, children }) {
       <span className="field-label">{label}</span>
       {children}
     </label>
+  )
+}
+
+function normalizeImageUrls(entry) {
+  if (Array.isArray(entry?.imageUrls)) return entry.imageUrls.filter(Boolean)
+  return entry?.imageUrl ? [entry.imageUrl] : []
+}
+
+function readImageFiles(files) {
+  return Promise.all(
+    Array.from(files || [])
+      .filter((file) => file.type.startsWith('image/'))
+      .map((file) =>
+        new Promise((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = async () => {
+            try {
+              resolve(await compressImageDataUrl(reader.result))
+            } catch {
+              resolve(reader.result)
+            }
+          }
+          reader.onerror = reject
+          reader.readAsDataURL(file)
+        }),
+      ),
+  )
+}
+
+function ProgressImages({ imageUrls }) {
+  const urls = Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : []
+  if (!urls.length) return null
+
+  return (
+    <div className="md:col-span-2">
+      <dt className="font-semibold text-slate-500">Hình ảnh</dt>
+      <dd className="mt-2 flex flex-wrap gap-2">
+        {urls.map((url, index) => (
+          <a key={`${url.slice(0, 32)}-${index}`} href={url} target="_blank" rel="noreferrer" className="inline-block">
+            <img src={url} alt={`Hình ảnh diễn biến ${index + 1}`} className="h-28 w-28 rounded-md border border-slate-200 object-cover" />
+          </a>
+        ))}
+      </dd>
+    </div>
+  )
+}
+
+function ProgressImageInput({ imageUrls, onAddImages, onRemoveImage }) {
+  const urls = Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : []
+
+  const handleFiles = async (event) => {
+    const nextImages = await readImageFiles(event.target.files)
+    if (nextImages.length) onAddImages(nextImages)
+    event.target.value = ''
+  }
+
+  return (
+    <div className="rounded-lg border border-dashed border-hospital-200 bg-hospital-50/50 p-3 md:col-span-2">
+      <span className="field-label">Hình ảnh diễn biến</span>
+      <div className="flex flex-wrap gap-2">
+        <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+          <Plus size={16} />
+          Thêm ảnh
+          <input className="hidden" type="file" accept="image/*" multiple onChange={handleFiles} />
+        </label>
+        <label className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
+          <Camera size={16} />
+          Chụp ảnh
+          <input className="hidden" type="file" accept="image/*" capture="environment" onChange={handleFiles} />
+        </label>
+      </div>
+      {!!urls.length && (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {urls.map((url, index) => (
+            <div key={`${url.slice(0, 32)}-${index}`} className="relative">
+              <img src={url} alt={`Ảnh ${index + 1}`} className="h-24 w-24 rounded-md border border-slate-200 object-cover" />
+              <button
+                type="button"
+                onClick={() => onRemoveImage(index)}
+                className="absolute -right-2 -top-2 flex h-6 w-6 items-center justify-center rounded-full bg-red-600 text-white shadow"
+                aria-label="Xóa ảnh"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -708,6 +869,115 @@ function TopBar({ report, activeMenu }) {
   )
 }
 
+function LoginScreen({ users, onLogin, loadingMessage }) {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+
+  const submitLogin = (event) => {
+    event.preventDefault()
+    const normalizedUsername = username.trim().toLowerCase()
+    const normalizedPassword = password.trim()
+    const matchedUser = users.find((user) =>
+      String(user.username || '').trim().toLowerCase() === normalizedUsername
+      && String(user.password || '').trim() === normalizedPassword,
+    )
+
+    if (!matchedUser) {
+      setError(users.length ? 'Tên đăng nhập hoặc mật khẩu không đúng.' : 'Chưa tải được danh sách user.')
+      return
+    }
+
+    setError('')
+    onLogin(matchedUser)
+  }
+
+  return (
+    <main className="min-h-screen bg-[radial-gradient(circle_at_top_left,#dff7f4_0,#f7fbfc_34%,#eef5f7_100%)] p-4 text-slate-950">
+      <div className="mx-auto flex min-h-[calc(100vh-2rem)] max-w-6xl items-center justify-center">
+        <section className="grid w-full overflow-hidden rounded-2xl border border-hospital-100 bg-white shadow-2xl md:grid-cols-[1fr_1.05fr]">
+          <div className="relative hidden min-h-[560px] overflow-hidden bg-hospital-700 p-10 text-white md:block">
+            <div className="absolute inset-0 bg-[linear-gradient(135deg,rgba(255,255,255,.14),transparent_34%),radial-gradient(circle_at_30%_20%,rgba(103,232,249,.24),transparent_30%),radial-gradient(circle_at_70%_70%,rgba(45,212,191,.22),transparent_34%)]" />
+            <div className="relative z-10 flex h-full flex-col justify-between">
+              <div className="flex items-center gap-3">
+                <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/12">
+                  <Hospital size={24} />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold uppercase tracking-normal text-cyan-100">Báo cáo trực</p>
+                  <p className="text-xs text-cyan-100/80">Hệ thống bệnh viện</p>
+                </div>
+              </div>
+              <div>
+                <div className="mb-10 h-52 w-52 rotate-45 rounded-3xl bg-cyan-300/20 shadow-[0_30px_80px_rgba(0,0,0,.22)]">
+                  <div className="h-full w-full -translate-x-8 translate-y-8 rounded-3xl border border-white/20 bg-white/10" />
+                </div>
+                <h1 className="text-4xl font-bold tracking-normal">Welcome :)</h1>
+                <p className="mt-4 max-w-sm text-base leading-7 text-cyan-50">
+                  Đăng nhập để tạo báo cáo khoa, quản lý bệnh nhân và nhật ký diễn biến theo ca trực.
+                </p>
+              </div>
+              <p className="text-xs text-cyan-100/75">© 2026 Bệnh viện 103</p>
+            </div>
+          </div>
+
+          <form onSubmit={submitLogin} className="flex min-h-[560px] flex-col justify-center p-6 md:p-12">
+            <div className="mb-8">
+              <p className="text-sm font-semibold uppercase tracking-normal text-hospital-600">Sign in to continue</p>
+              <h2 className="mt-2 text-3xl font-bold tracking-normal text-slate-950">Đăng nhập hệ thống</h2>
+              <p className="mt-3 text-sm text-slate-500">Tên đăng nhập lấy theo bảng User trong hệ thống.</p>
+            </div>
+
+            <div className="space-y-4">
+              <label className="block">
+                <span className="field-label">Tên đăng nhập</span>
+                <div className="flex h-12 items-center gap-3 rounded-lg border border-slate-200 bg-white px-3 focus-within:border-hospital-400 focus-within:ring-2 focus-within:ring-hospital-100">
+                  <User size={18} className="text-hospital-600" />
+                  <input
+                    className="h-full flex-1 border-0 bg-transparent text-sm outline-none"
+                    value={username}
+                    onChange={(event) => setUsername(event.target.value)}
+                    autoComplete="username"
+                    placeholder="Username"
+                  />
+                </div>
+              </label>
+              <label className="block">
+                <span className="field-label">Mật khẩu</span>
+                <div className="flex h-12 items-center gap-3 rounded-lg border border-slate-200 bg-white px-3 focus-within:border-hospital-400 focus-within:ring-2 focus-within:ring-hospital-100">
+                  <Lock size={18} className="text-hospital-600" />
+                  <input
+                    className="h-full flex-1 border-0 bg-transparent text-sm outline-none"
+                    type="password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    autoComplete="current-password"
+                    placeholder="Password"
+                  />
+                </div>
+              </label>
+            </div>
+
+            {(error || loadingMessage) && (
+              <p className={`mt-4 text-sm font-medium ${error ? 'text-red-600' : 'text-hospital-700'}`}>
+                {error || loadingMessage}
+              </p>
+            )}
+
+            <button type="submit" className="mt-6 inline-flex h-12 items-center justify-center gap-2 rounded-lg bg-hospital-600 px-4 text-sm font-bold text-white shadow-lg shadow-hospital-600/20 hover:bg-hospital-700">
+              <LogIn size={18} />
+              Đăng nhập
+            </button>
+            <p className="mt-3 text-xs text-slate-500">
+              Tài khoản mẫu: nguyenan / 123456
+            </p>
+          </form>
+        </section>
+      </div>
+    </main>
+  )
+}
+
 function DepartmentReportList({ reports, onCreate, onView, onEdit, onDelete }) {
   return (
     <section className="rounded-lg border border-slate-200 bg-white shadow-panel">
@@ -761,12 +1031,40 @@ function DepartmentReportList({ reports, onCreate, onView, onEdit, onDelete }) {
   )
 }
 
-function ReportMetaForm({ report, setReport, patients }) {
+function ReportMetaForm({ report, setReport, patients, catalogUnits = [] }) {
+  const [reportDateText, setReportDateText] = useState(formatDateVN(report.date))
+  const [reportDateError, setReportDateError] = useState('')
+
+  useEffect(() => {
+    setReportDateText(formatDateVN(report.date))
+    setReportDateError('')
+  }, [report.date])
+
   const update = (field, value) => {
     setReport((current) => {
       const next = { ...current, [field]: value }
       return field === 'date' ? { ...next, ...computeDailyStats(patients, value) } : next
     })
+  }
+
+  const updateReportDateText = (value) => {
+    setReportDateText(value)
+    const iso = parseDateVN(value)
+    if (iso) {
+      update('date', iso)
+      setReportDateError('')
+    }
+  }
+
+  const normalizeReportDateText = () => {
+    const iso = parseDateVN(reportDateText)
+    if (iso) {
+      update('date', iso)
+      setReportDateText(formatDateVN(iso))
+      setReportDateError('')
+    } else {
+      setReportDateError('Ngày không hợp lệ. Nhập theo định dạng dd/mm/yyyy.')
+    }
   }
 
   return (
@@ -777,10 +1075,29 @@ function ReportMetaForm({ report, setReport, patients }) {
           <p className="text-sm text-slate-500">Thông tin chung để tổng hợp báo cáo trực khoa, khối và chỉ huy.</p>
         </div>
         <FileText className="text-hospital-600" size={20} />
-      </div>
-      <div className="grid gap-4 md:grid-cols-3">
-        <Field label="Thời gian trực">
-          <input className="field-input" type="date" value={report.date} onChange={(event) => update('date', event.target.value)} />
+        </div>
+        <div className="grid gap-4 md:grid-cols-3">
+          <Field label="Thời gian trực">
+          <div className="flex items-center gap-2">
+            <input
+              className="field-input flex-1"
+              value={reportDateText}
+              placeholder="dd/mm/yyyy"
+              onChange={(event) => updateReportDateText(event.target.value)}
+              onBlur={normalizeReportDateText}
+            />
+            <input
+              className="field-input h-9 w-12 p-0 text-transparent"
+              type="date"
+              value={toSafeISO(report.date)}
+              onChange={(event) => {
+                update('date', event.target.value)
+                setReportDateText(formatDateVN(event.target.value))
+                setReportDateError('')
+              }}
+            />
+          </div>
+          {reportDateError && <p className="mt-2 text-sm text-red-600">{reportDateError}</p>}
         </Field>
         <Field label="Người báo cáo">
           <input className="field-input bg-slate-50" value={report.reporter || ''} readOnly />
@@ -790,9 +1107,15 @@ function ReportMetaForm({ report, setReport, patients }) {
         </Field>
         <Field label="Khoa">
           <select className="field-input" value={report.department} onChange={(event) => update('department', event.target.value)}>
-            {departments.map((department) => (
-              <option key={department}>{department}</option>
-            ))}
+            <option value="">Chọn khoa</option>
+            {catalogUnits
+              .filter((u) => (u.unitType || 'Khoa') === 'Khoa' && (u.isActive ?? true))
+              .sort((a, b) => (a.displayOrder || 0) - (b.displayOrder || 0))
+              .map((unit) => (
+                <option key={unit.id || unit.unitCode} value={unit.unitName || unit.unitCode}>
+                  {formatUnitOption(unit)}
+                </option>
+              ))}
           </select>
         </Field>
         <Field label="Bác sĩ trực">
@@ -840,18 +1163,34 @@ function SummaryPanel({ report, setReport }) {
             </Field>
           </div>
         ))}
-        <Field label="Bất thường khác">
-          <input className="field-input" value={report.incidents} onChange={(event) => setReport((current) => ({ ...current, incidents: event.target.value }))} />
-        </Field>
       </div>
     </section>
   )
 }
 
-function PatientDirectory({ patients, setPatients, reportEntries, setReportEntries }) {
+function OtherContentPanel({ report, setReport }) {
+  return (
+    <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-panel">
+      <div className="mb-4">
+        <h2 className="text-base font-semibold text-slate-950">Nội dung khác</h2>
+        <p className="text-sm text-slate-500">Ghi nhận sự cố phần mềm, thiếu thuốc, vật tư, trốn viện hoặc thông tin cần bàn giao thêm.</p>
+      </div>
+      <Field label="Nội dung khác">
+        <textarea
+          className="field-textarea min-h-[140px]"
+          value={report.incidents}
+          onChange={(event) => setReport((current) => ({ ...current, incidents: event.target.value }))}
+        />
+      </Field>
+    </section>
+  )
+}
+
+function PatientDirectory({ patients, setPatients, reportEntries, setReportEntries, setMessage }) {
   const [statusFilter, setStatusFilter] = useState('all')
   const [showAddForm, setShowAddForm] = useState(false)
   const [viewPatient, setViewPatient] = useState(null)
+  const [expandedJournalDates, setExpandedJournalDates] = useState({})
   const [progressPatient, setProgressPatient] = useState(null)
   const [progressDraft, setProgressDraft] = useState({
     category: 'Theo dõi',
@@ -859,8 +1198,12 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
     clinicalProgress: '',
     paraclinical: '',
     intervention: '',
+    imageUrl: '',
+    imageUrls: [],
     note: '',
   })
+  const [progressDateText, setProgressDateText] = useState(formatDateVN(progressDraft.progressDate))
+  const [progressDateError, setProgressDateError] = useState('')
   const [patientDraft, setPatientDraft] = useState({
     idbn: '',
     fullName: '',
@@ -892,6 +1235,17 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
       .filter((entry) => entry.idbn === viewPatient.idbn)
       .sort((first, second) => (second.progressDate || '').localeCompare(first.progressDate || ''))
   }, [reportEntries, viewPatient])
+  const viewPatientJournalGroups = useMemo(() => {
+    const groups = viewPatientJournal.reduce((result, entry) => {
+      const dateKey = entry.progressDate || 'Không có ngày'
+      result[dateKey] = [...(result[dateKey] || []), entry]
+      return result
+    }, {})
+
+    return Object.entries(groups)
+      .sort(([firstDate], [secondDate]) => secondDate.localeCompare(firstDate))
+      .map(([date, rows]) => ({ date, rows }))
+  }, [viewPatientJournal])
 
   const openProgressModal = (patient) => {
     setProgressPatient(patient)
@@ -901,25 +1255,66 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
       clinicalProgress: '',
       paraclinical: '',
       intervention: '',
+      imageUrl: '',
+      imageUrls: [],
       note: '',
     })
+    setProgressDateText(formatDateVN(todayISO()))
   }
   const updateProgressDraft = (field, value) => {
     setProgressDraft((current) => ({ ...current, [field]: value }))
   }
-  const saveProgress = () => {
-    if (!progressPatient) return
-    setReportEntries((current) => [
+  const addProgressImages = (images) => {
+    setProgressDraft((current) => ({ ...current, imageUrls: [...(current.imageUrls || []), ...images] }))
+  }
+  const removeProgressImage = (index) => {
+    setProgressDraft((current) => ({
       ...current,
-      {
+      imageUrls: (current.imageUrls || []).filter((_, imageIndex) => imageIndex !== index),
+    }))
+  }
+  const saveProgress = async () => {
+    if (!progressPatient) return
+    try {
+      // validate date
+      const iso = parseDateVN(progressDateText) || progressDraft.progressDate
+      if (!iso) {
+        setProgressDateError('Ngày không hợp lệ. Nhập theo định dạng dd/mm/yyyy.')
+        return
+      }
+
+      const entryId = crypto.randomUUID()
+      const uploadedImageUrls = await uploadProgressImagesToSupabase(progressDraft.imageUrls || [], {
+        idbn: progressPatient.idbn,
+        entryId,
+      })
+
+      const entry = {
         ...reportEntryTemplate,
         ...progressDraft,
-        id: crypto.randomUUID(),
+        imageUrls: uploadedImageUrls,
+        imageUrl: uploadedImageUrls[0] || '',
+        progressDate: iso,
+        id: entryId,
         idbn: progressPatient.idbn || '',
         source: 'patient-progress',
-      },
-    ])
-    setProgressPatient(null)
+      }
+
+      setReportEntries((current) => [...current, entry])
+      ;(async () => {
+        try {
+          const result = await upsertPatientProgressEntry(entry)
+          setMessage(result.source === 'supabase' ? 'Đã lưu diễn biến vào Supabase.' : 'Chưa cấu hình Supabase, đã lưu diễn biến trong trình duyệt.')
+        } catch (error) {
+          setMessage(`Lỗi lưu diễn biến Supabase: ${error.message}`)
+        }
+      })()
+      setProgressPatient(null)
+      setProgressDateError('')
+    } catch (err) {
+      console.error('Lỗi khi lưu diễn biến:', err)
+      setMessage(`Lỗi khi lưu diễn biến: ${err?.message || err}`)
+    }
   }
   const updatePatientDraft = (field, value) => {
     setPatientDraft((current) => ({ ...current, [field]: value }))
@@ -941,7 +1336,22 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
   }
   const savePatient = () => {
     if (!patientDraft.idbn || !patientDraft.fullName) return
-    setPatients((current) => [...current, patientDraft])
+    const newPatient = { ...patientDraft }
+    setPatients((current) => [...current, newPatient])
+    // persist immediately to Supabase if configured
+    ;(async () => {
+      try {
+        if (isSupabaseConfigured) {
+          await upsertPatientDirectory(newPatient)
+          setMessage('Đã lưu bệnh nhân vào CSDL.')
+        } else {
+          setMessage('Chưa cấu hình Supabase, lưu nháp trong trình duyệt.')
+        }
+      } catch (err) {
+        setMessage(`Lỗi lưu bệnh nhân: ${err.message}`)
+      }
+    })()
+
     resetPatientDraft()
     setShowAddForm(false)
   }
@@ -965,6 +1375,19 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
   }
   const displayValue = (value) => value || '-'
   const displayDate = (value) => (value ? formatDateVN(value) : '-')
+  const isJournalGroupOpen = (date, index) => expandedJournalDates[date] ?? index === 0
+  const toggleJournalGroup = (date, index) => {
+    setExpandedJournalDates((current) => ({
+      ...current,
+      [date]: !(current[date] ?? index === 0),
+    }))
+  }
+  const InfoLine = ({ label, value, className = '' }) => (
+    <p className={`text-sm ${className}`}>
+      <span className="font-semibold text-slate-500">{label}: </span>
+      <span className="text-slate-900">{value}</span>
+    </p>
+  )
 
   if (viewPatient) {
     return (
@@ -974,92 +1397,173 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
             <h2 className="text-base font-semibold text-slate-950">Thông tin bệnh nhân</h2>
             <p className="text-sm text-slate-500">{viewPatient.idbn} - {viewPatient.fullName}</p>
           </div>
-          <button onClick={() => setViewPatient(null)} className="inline-flex h-9 items-center rounded-md border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
-            Quay lại danh sách
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={() => openProgressModal(viewPatient)} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
+              <Plus size={16} />
+              Thêm diễn biến
+            </button>
+            <button onClick={() => setViewPatient(null)} className="inline-flex h-9 items-center rounded-md border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+              Quay lại danh sách
+            </button>
+          </div>
         </div>
-        <dl className="grid gap-4 p-4 text-sm md:grid-cols-2 lg:grid-cols-3">
-          <div>
-            <dt className="font-semibold text-slate-500">IDBN</dt>
-            <dd className="text-slate-900">{displayValue(viewPatient.idbn)}</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-slate-500">Họ và tên</dt>
-            <dd className="text-slate-900">{displayValue(viewPatient.fullName)}</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-slate-500">Năm sinh</dt>
-            <dd className="text-slate-900">{displayValue(viewPatient.birthYear)}</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-slate-500">Ngày vào viện</dt>
-            <dd className="text-slate-900">{displayDate(viewPatient.admissionDate)}</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-slate-500">Ngày vào khoa</dt>
-            <dd className="text-slate-900">{displayDate(viewPatient.departmentDate)}</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-slate-500">Khoa chuyển đến</dt>
-            <dd className="text-slate-900">{displayValue(viewPatient.transferTo)}</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-slate-500">Ngày chuyển đi</dt>
-            <dd className="text-slate-900">{displayDate(viewPatient.transferOutDate)}</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-slate-500">Trạng thái</dt>
-            <dd className="text-slate-900">{displayValue(viewPatient.outcome)}</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-slate-500">Ngày ra</dt>
-            <dd className="text-slate-900">{displayDate(viewPatient.outcomeDate)}</dd>
-          </div>
-          <div className="md:col-span-2 lg:col-span-3">
-            <dt className="font-semibold text-slate-500">Chẩn đoán</dt>
-            <dd className="text-slate-900">{displayValue(viewPatient.diagnosis)}</dd>
-          </div>
-          <div className="md:col-span-2 lg:col-span-3">
-            <dt className="font-semibold text-slate-500">Bệnh sử</dt>
-            <dd className="text-slate-900">{displayValue(viewPatient.history)}</dd>
-          </div>
-        </dl>
+        <div className="grid gap-3 p-4 md:grid-cols-2 lg:grid-cols-3">
+          <InfoLine label="IDBN" value={displayValue(viewPatient.idbn)} />
+          <InfoLine label="Họ và tên" value={displayValue(viewPatient.fullName)} />
+          <InfoLine label="Năm sinh" value={displayValue(viewPatient.birthYear)} />
+          <InfoLine label="Ngày vào viện" value={displayDate(viewPatient.admissionDate)} />
+          <InfoLine label="Ngày vào khoa" value={displayDate(viewPatient.departmentDate)} />
+          <InfoLine label="Khoa chuyển đến" value={displayValue(viewPatient.transferTo)} />
+          <InfoLine label="Ngày chuyển đi" value={displayDate(viewPatient.transferOutDate)} />
+          <InfoLine label="Trạng thái" value={displayValue(viewPatient.outcome)} />
+          <InfoLine label="Ngày ra" value={displayDate(viewPatient.outcomeDate)} />
+          <InfoLine label="Chẩn đoán" value={displayValue(viewPatient.diagnosis)} className="md:col-span-2 lg:col-span-3" />
+          <InfoLine label="Bệnh sử" value={displayValue(viewPatient.history)} className="md:col-span-2 lg:col-span-3" />
+        </div>
         <div className="border-t border-slate-200 p-4">
           <h3 className="text-sm font-semibold text-slate-950">Nhật ký diễn biến bệnh nhân</h3>
           <div className="mt-3 space-y-3">
-            {viewPatientJournal.map((entry) => (
-              <div key={entry.id} className="rounded-md border border-slate-200 p-3 text-sm">
-                <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-                  <p className="font-semibold text-slate-900">{entry.category || 'Theo dõi'}</p>
-                  <p className="text-slate-500">{displayDate(entry.progressDate)}</p>
+            {viewPatientJournalGroups.map((group, groupIndex) => (
+              <div key={group.date} className="rounded-md border border-slate-200 bg-white">
+                <button
+                  type="button"
+                  onClick={() => toggleJournalGroup(group.date, groupIndex)}
+                  className="flex w-full items-center justify-between gap-3 px-3 py-3 text-left text-sm font-semibold text-slate-900 hover:bg-slate-50"
+                >
+                  <span>{displayDate(group.date)}</span>
+                  <span className="text-xs font-medium text-slate-500">
+                    {group.rows.length} diễn biến - {isJournalGroupOpen(group.date, groupIndex) ? 'Ẩn' : 'Hiện'}
+                  </span>
+                </button>
+                {isJournalGroupOpen(group.date, groupIndex) && (
+                <div className="space-y-3 border-t border-slate-200 p-3">
+                  {group.rows.map((entry) => (
+                    <div key={entry.id} className="rounded-md border border-slate-200 p-3 text-sm">
+                      <p className="font-semibold text-slate-900">{entry.category || 'Theo dõi'}</p>
+                      <dl className="mt-3 grid gap-3 md:grid-cols-2">
+                        <div>
+                          <dt className="font-semibold text-slate-500">Diễn biến lâm sàng</dt>
+                          <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.clinicalProgress)}</dd>
+                        </div>
+                        <div>
+                          <dt className="font-semibold text-slate-500">Cận lâm sàng</dt>
+                          <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.paraclinical)}</dd>
+                        </div>
+                        <div>
+                          <dt className="font-semibold text-slate-500">Can thiệp</dt>
+                          <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.intervention)}</dd>
+                        </div>
+                        <ProgressImages imageUrls={normalizeImageUrls(entry)} />
+                        <div>
+                          <dt className="font-semibold text-slate-500">Ghi chú</dt>
+                          <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.note)}</dd>
+                        </div>
+                      </dl>
+                    </div>
+                  ))}
                 </div>
-                <dl className="mt-3 grid gap-3 md:grid-cols-2">
-                  <div>
-                    <dt className="font-semibold text-slate-500">Diễn biến lâm sàng</dt>
-                    <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.clinicalProgress)}</dd>
-                  </div>
-                  <div>
-                    <dt className="font-semibold text-slate-500">Cận lâm sàng</dt>
-                    <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.paraclinical)}</dd>
-                  </div>
-                  <div>
-                    <dt className="font-semibold text-slate-500">Can thiệp</dt>
-                    <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.intervention)}</dd>
-                  </div>
-                  <div>
-                    <dt className="font-semibold text-slate-500">Ghi chú</dt>
-                    <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.note)}</dd>
-                  </div>
-                </dl>
+                )}
               </div>
             ))}
-            {!viewPatientJournal.length && (
+            {!viewPatientJournalGroups.length && (
               <p className="rounded-md border border-dashed border-slate-200 px-3 py-4 text-center text-sm text-slate-500">
                 Chưa có diễn biến.
               </p>
             )}
           </div>
         </div>
+        {progressPatient && (
+          <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/40 px-4">
+            <div className="max-h-[90vh] w-full max-w-4xl overflow-hidden rounded-lg bg-white shadow-xl">
+              <div className="flex items-center justify-between border-b border-slate-200 p-4">
+                <div>
+                  <h3 className="text-base font-semibold text-slate-950">Thêm diễn biến</h3>
+                  <p className="text-sm text-slate-500">{progressPatient.idbn} - {progressPatient.fullName}</p>
+                </div>
+                <button onClick={() => setProgressPatient(null)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100" aria-label="Đóng modal thêm diễn biến">
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="grid max-h-[65vh] gap-4 overflow-y-auto p-4 md:grid-cols-2">
+                <Field label="Ngày diễn biến">
+                  <div className="relative flex items-center gap-2">
+                    <input
+                      type="text"
+                      className="field-input flex-1"
+                      placeholder="dd/mm/yyyy"
+                      value={progressDateText}
+                      onChange={(event) => {
+                        const value = event.target.value
+                        setProgressDateText(value)
+                        const iso = parseDateVN(value)
+                        if (iso) {
+                          updateProgressDraft('progressDate', iso)
+                          setProgressDateError('')
+                        }
+                      }}
+                      onBlur={() => {
+                        const iso = parseDateVN(progressDateText)
+                        if (iso) {
+                          updateProgressDraft('progressDate', iso)
+                          setProgressDateText(formatDateVN(iso))
+                          setProgressDateError('')
+                        } else {
+                          setProgressDateError('Ngày không hợp lệ. Nhập theo định dạng dd/mm/yyyy.')
+                        }
+                      }}
+                    />
+                    <input
+                      type="date"
+                      className="field-input h-9 w-12 p-0 text-transparent"
+                      value={toSafeISO(progressDraft.progressDate)}
+                      onChange={(event) => {
+                        const value = event.target.value
+                        updateProgressDraft('progressDate', value)
+                        setProgressDateText(formatDateVN(value))
+                        setProgressDateError('')
+                      }}
+                    />
+                  </div>
+                  {progressDateError && <p className="mt-2 text-sm text-red-600">{progressDateError}</p>}
+                </Field>
+                <Field label="Loại báo cáo">
+                  <select className="field-input" value={progressDraft.category} onChange={(event) => updateProgressDraft('category', event.target.value)}>
+                    <option>Theo dõi</option>
+                    <option>Tử vong</option>
+                    <option>Nặng xin về</option>
+                    <option>Chuyển viện</option>
+                    <option>Vào viện</option>
+                    <option>Phẫu thuật cấp cứu</option>
+                    <option>Can thiệp cấp cứu</option>
+                    <option>Bất thường</option>
+                  </select>
+                </Field>
+                <ProgressImageInput imageUrls={progressDraft.imageUrls} onAddImages={addProgressImages} onRemoveImage={removeProgressImage} />
+                <Field label="Diễn biến lâm sàng">
+                  <textarea className="field-textarea min-h-[120px]" value={progressDraft.clinicalProgress} onChange={(event) => updateProgressDraft('clinicalProgress', event.target.value)} />
+                </Field>
+                <Field label="Cận lâm sàng">
+                  <textarea className="field-textarea min-h-[120px]" value={progressDraft.paraclinical} onChange={(event) => updateProgressDraft('paraclinical', event.target.value)} />
+                </Field>
+                <Field label="Can thiệp">
+                  <textarea className="field-textarea min-h-[120px]" value={progressDraft.intervention} onChange={(event) => updateProgressDraft('intervention', event.target.value)} />
+                </Field>
+                <Field label="Ghi chú">
+                  <textarea className="field-textarea min-h-[120px]" value={progressDraft.note} onChange={(event) => updateProgressDraft('note', event.target.value)} />
+                </Field>
+              </div>
+              <div className="flex justify-end gap-2 border-t border-slate-200 p-4">
+                <button onClick={() => setProgressPatient(null)} className="inline-flex h-9 items-center rounded-md border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+                  Hủy
+                </button>
+                <button onClick={saveProgress} className="inline-flex h-9 items-center gap-2 rounded-md bg-hospital-600 px-4 text-sm font-semibold text-white hover:bg-hospital-700">
+                  <Save size={16} />
+                  Lưu diễn biến
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </section>
     )
   }
@@ -1106,16 +1610,16 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
               <input className="field-input" value={patientDraft.birthYear} onChange={(event) => updatePatientDraft('birthYear', event.target.value)} />
             </Field>
             <Field label="Ngày vào viện">
-              <input className="field-input" type="date" value={patientDraft.admissionDate} onChange={(event) => updatePatientDraft('admissionDate', event.target.value)} />
+              <input className="field-input" type="date" value={toSafeISO(patientDraft.admissionDate)} onChange={(event) => updatePatientDraft('admissionDate', event.target.value)} />
             </Field>
             <Field label="Ngày vào khoa">
-              <input className="field-input" type="date" value={patientDraft.departmentDate} onChange={(event) => updatePatientDraft('departmentDate', event.target.value)} />
+              <input className="field-input" type="date" value={toSafeISO(patientDraft.departmentDate)} onChange={(event) => updatePatientDraft('departmentDate', event.target.value)} />
             </Field>
             <Field label="Khoa chuyển đến">
               <input className="field-input" value={patientDraft.transferTo} onChange={(event) => updatePatientDraft('transferTo', event.target.value)} />
             </Field>
             <Field label="Ngày chuyển đi">
-              <input className="field-input" type="date" value={patientDraft.transferOutDate} onChange={(event) => updatePatientDraft('transferOutDate', event.target.value)} />
+              <input className="field-input" type="date" value={toSafeISO(patientDraft.transferOutDate)} onChange={(event) => updatePatientDraft('transferOutDate', event.target.value)} />
             </Field>
             <Field label="Trạng thái">
               <select className="field-input" value={patientDraft.outcome} onChange={(event) => updatePatientDraft('outcome', event.target.value)}>
@@ -1127,7 +1631,7 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
               </select>
             </Field>
             <Field label="Ngày ra">
-              <input className="field-input" type="date" value={patientDraft.outcomeDate} onChange={(event) => updatePatientDraft('outcomeDate', event.target.value)} />
+              <input className="field-input" type="date" value={toSafeISO(patientDraft.outcomeDate)} onChange={(event) => updatePatientDraft('outcomeDate', event.target.value)} />
             </Field>
             <div className="md:col-span-2 xl:col-span-2">
               <Field label="Chẩn đoán">
@@ -1202,9 +1706,15 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
                 <h3 className="text-base font-semibold text-slate-950">Thông tin bệnh nhân</h3>
                 <p className="text-sm text-slate-500">{viewPatient.idbn} - {viewPatient.fullName}</p>
               </div>
-              <button onClick={() => setViewPatient(null)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100" aria-label="Đóng modal xem bệnh nhân">
-                <X size={16} />
-              </button>
+              <div className="flex items-center gap-2">
+                <button onClick={() => openProgressModal(viewPatient)} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
+                  <Plus size={16} />
+                  Thêm diễn biến
+                </button>
+                <button onClick={() => setViewPatient(null)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100" aria-label="Đóng modal xem bệnh nhân">
+                  <X size={16} />
+                </button>
+              </div>
             </div>
             <dl className="grid gap-4 p-4 text-sm md:grid-cols-2 lg:grid-cols-3">
               <div>
@@ -1274,6 +1784,7 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
                         <dt className="font-semibold text-slate-500">Can thiệp</dt>
                         <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.intervention)}</dd>
                       </div>
+                      <ProgressImages imageUrls={normalizeImageUrls(entry)} />
                       <div>
                         <dt className="font-semibold text-slate-500">Ghi chú</dt>
                         <dd className="whitespace-pre-wrap text-slate-900">{displayValue(entry.note)}</dd>
@@ -1305,19 +1816,61 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
             </div>
             <div className="grid max-h-[65vh] gap-4 overflow-y-auto p-4 md:grid-cols-2">
               <Field label="Ngày diễn biến">
-                <input className="field-input" type="date" value={progressDraft.progressDate} onChange={(event) => updateProgressDraft('progressDate', event.target.value)} />
+                <div className="relative flex items-center gap-2">
+                  <input
+                    type="text"
+                    className="field-input flex-1"
+                    placeholder="dd/mm/yyyy"
+                    value={progressDateText}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      setProgressDateText(v)
+                      const iso = parseDateVN(v)
+                      if (iso) {
+                        updateProgressDraft('progressDate', iso)
+                        setProgressDateError('')
+                      }
+                    }}
+                    onBlur={() => {
+                      const iso = parseDateVN(progressDateText)
+                      if (iso) {
+                        updateProgressDraft('progressDate', iso)
+                        setProgressDateText(formatDateVN(iso))
+                        setProgressDateError('')
+                      } else {
+                        setProgressDateError('Ngày không hợp lệ. Nhập theo định dạng dd/mm/yyyy.')
+                      }
+                    }}
+                  />
+                  <input
+                    type="date"
+                    className="field-input h-9 w-12 p-0 text-transparent"
+                    value={toSafeISO(progressDraft.progressDate)}
+                    onChange={(event) => {
+                      const value = event.target.value
+                      updateProgressDraft('progressDate', value)
+                      setProgressDateText(formatDateVN(value))
+                      setProgressDateError('')
+                    }}
+                  />
+                </div>
+                {progressDateError && (
+                  <p className="mt-2 text-sm text-red-600">{progressDateError}</p>
+                )}
               </Field>
               <Field label="Loại báo cáo">
                 <select className="field-input" value={progressDraft.category} onChange={(event) => updateProgressDraft('category', event.target.value)}>
                   <option>Theo dõi</option>
                   <option>Tử vong</option>
                   <option>Nặng xin về</option>
-                  <option>Chuyển viện</option>
-                  <option>Phẫu thuật cấp cứu</option>
+                <option>Chuyển viện</option>
+                <option>Vào viện</option>
+                <option>Phẫu thuật cấp cứu</option>
                   <option>Can thiệp cấp cứu</option>
                   <option>Bất thường</option>
                 </select>
               </Field>
+              <ProgressImageInput imageUrls={progressDraft.imageUrls} onAddImages={addProgressImages} onRemoveImage={removeProgressImage} />
               <Field label="Diễn biến lâm sàng">
                 <textarea className="field-textarea min-h-[120px]" value={progressDraft.clinicalProgress} onChange={(event) => updateProgressDraft('clinicalProgress', event.target.value)} />
               </Field>
@@ -1369,16 +1922,16 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
                 <input className="field-input" value={editPatientDraft.birthYear} onChange={(event) => updateEditPatientDraft('birthYear', event.target.value)} />
               </Field>
               <Field label="Ngày vào viện">
-                <input className="field-input" type="date" value={editPatientDraft.admissionDate} onChange={(event) => updateEditPatientDraft('admissionDate', event.target.value)} />
+                <input className="field-input" type="date" value={toSafeISO(editPatientDraft.admissionDate)} onChange={(event) => updateEditPatientDraft('admissionDate', event.target.value)} />
               </Field>
               <Field label="Ngày vào khoa">
-                <input className="field-input" type="date" value={editPatientDraft.departmentDate} onChange={(event) => updateEditPatientDraft('departmentDate', event.target.value)} />
+                <input className="field-input" type="date" value={toSafeISO(editPatientDraft.departmentDate)} onChange={(event) => updateEditPatientDraft('departmentDate', event.target.value)} />
               </Field>
               <Field label="Khoa chuyển đến">
                 <input className="field-input" value={editPatientDraft.transferTo} onChange={(event) => updateEditPatientDraft('transferTo', event.target.value)} />
               </Field>
               <Field label="Ngày chuyển đi">
-                <input className="field-input" type="date" value={editPatientDraft.transferOutDate || ''} onChange={(event) => updateEditPatientDraft('transferOutDate', event.target.value)} />
+                <input className="field-input" type="date" value={toSafeISO(editPatientDraft.transferOutDate)} onChange={(event) => updateEditPatientDraft('transferOutDate', event.target.value)} />
               </Field>
               <Field label="Trạng thái">
                 <select className="field-input" value={editPatientDraft.outcome || 'Đang điều trị'} onChange={(event) => updateEditPatientDraft('outcome', event.target.value)}>
@@ -1390,7 +1943,7 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
                 </select>
               </Field>
               <Field label="Ngày ra">
-                <input className="field-input" type="date" value={editPatientDraft.outcomeDate || ''} onChange={(event) => updateEditPatientDraft('outcomeDate', event.target.value)} />
+                <input className="field-input" type="date" value={toSafeISO(editPatientDraft.outcomeDate)} onChange={(event) => updateEditPatientDraft('outcomeDate', event.target.value)} />
               </Field>
               <div className="md:col-span-2">
                 <Field label="Chẩn đoán">
@@ -1422,12 +1975,18 @@ function PatientDirectory({ patients, setPatients, reportEntries, setReportEntri
   )
 }
 
-function UserDirectory({ users, setUsers, onSave, saveState }) {
+function UserDirectory({ users, setUsers, catalogUnits, onSave, saveState }) {
   const [selectedIndex, setSelectedIndex] = useState(null)
   const [panelMode, setPanelMode] = useState('view')
   const displayValue = (value) => value || '-'
   const displayPassword = (value) => (value ? '••••••' : '-')
   const selectedUser = selectedIndex === null ? null : users[selectedIndex]
+  const unitOptions = useMemo(() => {
+    return (catalogUnits || [])
+      .filter((unit) => unit.isActive !== false && (unit.unitCode || unit.unitName))
+      .map((unit) => formatUnitOption(unit))
+      .filter(Boolean)
+  }, [catalogUnits])
 
   const openUser = (index, mode) => {
     setSelectedIndex(index)
@@ -1442,10 +2001,10 @@ function UserDirectory({ users, setUsers, onSave, saveState }) {
         ...current,
         {
           fullName: '',
-          unit: '',
+          unit: unitOptions[0] || '',
           username: '',
           password: '',
-          role: 'Khoa báo cáo',
+          role: 'Người dùng',
         },
       ]
     })
@@ -1566,7 +2125,15 @@ function UserDirectory({ users, setUsers, onSave, saveState }) {
                   <input className="field-input" value={selectedUser.fullName} onChange={(event) => updateUser('fullName', event.target.value)} />
                 </Field>
                 <Field label="Đơn vị">
-                  <input className="field-input" value={selectedUser.unit} onChange={(event) => updateUser('unit', event.target.value)} />
+                  <select className="field-input" value={selectedUser.unit} onChange={(event) => updateUser('unit', event.target.value)}>
+                    <option value="">Chọn đơn vị</option>
+                    {selectedUser.unit && !unitOptions.includes(selectedUser.unit) && (
+                      <option value={selectedUser.unit}>{selectedUser.unit}</option>
+                    )}
+                    {unitOptions.map((unitName) => (
+                      <option key={unitName} value={unitName}>{unitName}</option>
+                    ))}
+                  </select>
                 </Field>
                 <Field label="User">
                   <input className="field-input" value={selectedUser.username} onChange={(event) => updateUser('username', event.target.value)} />
@@ -1576,10 +2143,11 @@ function UserDirectory({ users, setUsers, onSave, saveState }) {
                 </Field>
                 <Field label="Vai trò">
                   <select className="field-input" value={selectedUser.role} onChange={(event) => updateUser('role', event.target.value)}>
-                    <option>Khoa báo cáo</option>
-                    <option>Trực khối</option>
-                    <option>Trực chỉ huy</option>
+                    {selectedUser.role && !['Quản trị', 'Người dùng'].includes(selectedUser.role) && (
+                      <option value={selectedUser.role}>{selectedUser.role}</option>
+                    )}
                     <option>Quản trị</option>
+                    <option>Người dùng</option>
                   </select>
                 </Field>
               </div>
@@ -1602,6 +2170,75 @@ function formatDateVN(dateValue) {
   const [year, month, day] = String(dateValue).slice(0, 10).split('-')
   if (!year || !month || !day) return dateValue
   return `${day}/${month}/${year}`
+}
+
+function parseDateVN(value) {
+  if (!value) return ''
+  const text = String(value).trim()
+  const isValidDate = (year, month, day) => {
+    const date = new Date(Number(year), Number(month) - 1, Number(day))
+    return date.getFullYear() === Number(year)
+      && date.getMonth() === Number(month) - 1
+      && date.getDate() === Number(day)
+  }
+
+  const isoMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (isoMatch) {
+    const [, year, month, day] = isoMatch
+    return isValidDate(year, month, day) ? text : ''
+  }
+
+  const m = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
+  if (m) {
+    const day = String(m[1]).padStart(2, '0')
+    const month = String(m[2]).padStart(2, '0')
+    const year = m[3]
+    return isValidDate(year, month, day) ? `${year}-${month}-${day}` : ''
+  }
+
+  return ''
+}
+
+function normalizeToISO(dateValue) {
+  if (!dateValue) return ''
+  const s = String(dateValue).trim()
+  // ISO
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s
+  // dd/mm/yyyy or d/m/yyyy
+  let m = s.match(/^(\d{1,2})[\/](\d{1,2})[\/](\d{4})$/)
+  if (m) {
+    const d = Number(m[1])
+    const mo = Number(m[2])
+    const year = m[3]
+    // decide if input is dd/mm or mm/dd: prefer dd/mm if day > 12
+    if (d > 12) {
+      return `${year}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+    }
+    // ambiguous if both <=12, assume dd/mm (Vietnam)
+    return `${year}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+  }
+  // mm/dd/yyyy
+  m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/)
+  if (m) {
+    const mo = Number(m[1])
+    const d = Number(m[2])
+    const year = m[3]
+    return `${year}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+  }
+  // try Date parse
+  const d = new Date(s)
+  if (!Number.isNaN(d.getTime())) {
+    const year = d.getFullYear()
+    const month = String(d.getMonth() + 1).padStart(2, '0')
+    const day = String(d.getDate()).padStart(2, '0')
+    return `${year}-${month}-${day}`
+  }
+  return ''
+}
+
+function toSafeISO(dateValue) {
+  const iso = normalizeToISO(dateValue)
+  return iso || ''
 }
 
 function sanitizePdfFileName(value) {
@@ -1643,6 +2280,7 @@ function PatientDetailLines({ rows, patientById, diagnosisLabel = 'Chẩn đoán
         <DottedLine label="Diễn biến lâm sàng" value={entry.clinicalProgress} />
         <DottedLine label="Cận lâm sàng" value={entry.paraclinical} />
         <DottedLine label="Can thiệp" value={entry.intervention} />
+        <DottedLine label="Hình ảnh" value={normalizeImageUrls(entry).length ? `${normalizeImageUrls(entry).length} ảnh` : ''} />
         <DottedLine label="Tóm tắt bệnh án" value={entry.note || patient?.history} />
       </div>
     )
@@ -1656,17 +2294,17 @@ function DepartmentReportDetail({ report, patients, entries }) {
       deaths: [],
       severeDischarge: [],
       emergency: [],
-      severeProgress: [],
+      admissions: [],
       watch: [],
     }
 
     entries
-      .filter((entry) => (!report.date || entry.progressDate === report.date) && entry.source !== 'patient-progress')
+      .filter((entry) => (!report.date || normalizeToISO(entry.progressDate) === normalizeToISO(report.date)) && entry.source !== 'patient-progress')
       .forEach((entry) => {
       if (entry.category === 'Tử vong') result.deaths.push(entry)
       else if (entry.category === 'Nặng xin về') result.severeDischarge.push(entry)
       else if (entry.category === 'Phẫu thuật cấp cứu' || entry.category === 'Can thiệp cấp cứu') result.emergency.push(entry)
-      else if (entry.category === 'Bất thường') result.severeProgress.push(entry)
+      else if (entry.category === 'Vào viện') result.admissions.push(entry)
       else result.watch.push(entry)
       })
 
@@ -1701,8 +2339,8 @@ function DepartmentReportDetail({ report, patients, entries }) {
         <p>* Các trường hợp báo cáo chi tiết</p>
         <PatientDetailLines rows={groups.emergency} patientById={patientById} />
 
-        <p>4. Bệnh nhân diễn biến nặng <i className="font-normal">(cả giờ hành chính và ngoài giờ)</i>: {groups.severeProgress.length}</p>
-        <PatientDetailLines rows={groups.severeProgress} patientById={patientById} />
+        <p>4. Bệnh nhân vào viện: {groups.admissions.length}</p>
+        <PatientDetailLines rows={groups.admissions} patientById={patientById} />
 
         <p>5. Bệnh nhân theo dõi</p>
         <p>* Tổng số bệnh nhân theo dõi báo cáo trực khối: {groups.watch.length}</p>
@@ -1727,168 +2365,149 @@ function DepartmentReportEntries({ patients, entries, setEntries, reportDate }) 
     [patients, reportDate],
   )
   const progressByPatientId = useMemo(() => {
-    const targetDate = reportDate || todayISO()
+    const targetISO = normalizeToISO(reportDate || todayISO())
     return entries.reduce((result, entry) => {
-      if (entry.idbn && entry.progressDate === targetDate && !entry.isReportSelection && !result.has(entry.idbn)) {
+      if (entry.idbn && normalizeToISO(entry.progressDate) === targetISO && !entry.isReportSelection && !result.has(entry.idbn)) {
         result.set(entry.idbn, entry)
       }
       return result
     }, new Map())
   }, [entries, reportDate])
-  const selectablePatients = useMemo(
-    () => eligiblePatients.filter((patient) => progressByPatientId.has(patient.idbn)),
-    [eligiblePatients, progressByPatientId],
-  )
-  const reportRows = useMemo(
-    () => entries.filter((entry) =>
-      entry.progressDate === (reportDate || todayISO())
+  const reportRows = useMemo(() => {
+    const targetISO = normalizeToISO(reportDate || todayISO())
+    return entries.filter((entry) =>
+      normalizeToISO(entry.progressDate) === targetISO
       && (entry.isReportSelection || (entry.idbn && entry.source !== 'patient-progress')),
-    ),
-    [entries, reportDate],
-  )
-  const unselectedPatients = useMemo(() => {
-    const selectedIds = new Set(reportRows.map((entry) => entry.idbn))
-    return selectablePatients.filter((patient) => !selectedIds.has(patient.idbn))
-  }, [reportRows, selectablePatients])
-
-  const updateEntry = (index, field, value) => {
-    setEntries((current) =>
-      current.map((entry, entryIndex) =>
-        entryIndex === index ? { ...entry, [field]: value } : entry,
-      ),
     )
-  }
-
-  const addEntry = () => {
+  }, [entries, reportDate])
+  const addEntry = (category) => {
     setEntries((current) => [
       ...current,
       {
         ...reportEntryTemplate,
         id: crypto.randomUUID(),
+        category,
         idbn: '',
         progressDate: reportDate || todayISO(),
         isReportSelection: true,
+        source: 'department-report',
       },
     ])
   }
 
-  const selectPatient = (index, idbn) => {
+  const selectPatient = (entryIndex, idbn, category) => {
     const selectedProgress = progressByPatientId.get(idbn)
-    if (!selectedProgress) {
-      updateEntry(index, 'idbn', idbn)
-      return
-    }
     setEntries((current) =>
-      current.map((entry, entryIndex) =>
-        entryIndex === index
-          ? {
-              ...selectedProgress,
-              id: entry.id || crypto.randomUUID(),
-              idbn,
-              progressDate: reportDate || todayISO(),
-              isReportSelection: true,
-              source: 'department-report',
-            }
-          : entry,
-      ),
+      current.map((entry, index) => {
+        if (index !== entryIndex) return entry
+        return {
+          ...reportEntryTemplate,
+          ...(selectedProgress || entry),
+          id: entry.id || crypto.randomUUID(),
+          idbn,
+          category,
+          progressDate: reportDate || todayISO(),
+          isReportSelection: true,
+          source: 'department-report',
+        }
+      }),
     )
   }
 
-  const removeEntry = (index) => setEntries((current) => current.filter((_, entryIndex) => entryIndex !== index))
+  const removeEntry = (entryIndex) => setEntries((current) => current.filter((_, index) => index !== entryIndex))
+
+  const renderReportRow = (entry, section) => {
+    const patient = patientById.get(entry.idbn)
+    const entryIndex = entries.indexOf(entry)
+    const selectPatients = eligiblePatients
+    const hasMatchedProgress = Boolean(entry.idbn && progressByPatientId.has(entry.idbn))
+
+    return (
+      <div key={entry.id || entryIndex} className="border-t border-slate-100 p-4">
+        <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div className="flex items-end gap-2">
+            <div className="min-w-0 flex-1">
+              <Field label="Chọn bệnh nhân">
+                <select className="field-input" value={entry.idbn} onChange={(event) => selectPatient(entryIndex, event.target.value, section.category)}>
+                  <option value="">Chọn theo IDBN - Họ tên</option>
+                  {selectPatients.map((item) => (
+                    <option key={item.idbn} value={item.idbn}>
+                      {item.idbn} - {item.fullName}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+            <button onClick={() => removeEntry(entryIndex)} className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-md border border-red-200 bg-white px-3 text-sm font-semibold text-red-600 hover:bg-red-50">
+              <Trash2 size={16} />
+              Xóa
+            </button>
+          </div>
+          {patient ? (
+            <dl className="mt-4 space-y-2 text-sm">
+              {!hasMatchedProgress && (
+                <div className="rounded-md border border-amber-200 bg-amber-50 p-2 text-amber-700">
+                  Bệnh nhân này chưa có diễn biến trùng ngày báo cáo. Vào Danh sách BN để thêm diễn biến trước khi lưu báo cáo.
+                </div>
+              )}
+              <div className="grid gap-3 md:grid-cols-4">
+                <div>
+                  <dt className="font-semibold text-slate-500">Họ và tên</dt>
+                  <dd className="text-slate-900">{patient.fullName || '-'}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold text-slate-500">Năm sinh</dt>
+                  <dd className="text-slate-900">{patient.birthYear || '-'}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold text-slate-500">Ngày vào viện</dt>
+                  <dd className="text-slate-900">{formatDateVN(patient.admissionDate)}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold text-slate-500">Ngày vào khoa</dt>
+                  <dd className="text-slate-900">{formatDateVN(patient.departmentDate)}</dd>
+                </div>
+              </div>
+            </dl>
+          ) : (
+            <p className="mt-4 text-sm text-amber-700">Chưa chọn bệnh nhân từ Danh sách BN.</p>
+          )}
+        </div>
+        </div>
+    )
+  }
 
   return (
     <section className="rounded-lg border border-slate-200 bg-white shadow-panel">
-      <div className="flex flex-col gap-3 border-b border-slate-200 p-4 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h2 className="text-base font-semibold text-slate-950">Danh sách bệnh nhân báo cáo</h2>
-          <p className="text-sm text-slate-500">Chọn bệnh nhân đã có diễn biến trong Danh sách BN. Báo cáo tự lấy diễn biến có ngày trùng ngày báo cáo.</p>
-        </div>
-        <button onClick={addEntry} disabled={!unselectedPatients.length} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-50 disabled:text-slate-400">
-          <Plus size={16} />
-          Thêm bệnh nhân báo cáo
-        </button>
+      <div className="border-b border-slate-200 p-4">
+        <h2 className="text-base font-semibold text-slate-950">Bệnh nhân báo cáo</h2>
+        <p className="text-sm text-slate-500">Chọn tên bệnh nhân trong từng phần. Báo cáo tự lấy diễn biến có ngày trùng ngày báo cáo.</p>
       </div>
-      <div className="divide-y divide-slate-100">
-        {reportRows.map((entry, index) => {
-          const patient = patientById.get(entry.idbn)
-          const entryIndex = entries.indexOf(entry)
-          const selectPatients = patient && !selectablePatients.some((item) => item.idbn === patient.idbn)
-            ? [patient, ...selectablePatients]
-            : selectablePatients
+      <div className="divide-y divide-slate-200">
+        {departmentReportSections.map((section, sectionIndex) => {
+          const sectionRows = reportRows.filter((entry) => (section.categories || [section.category]).includes(entry.category || 'Theo dõi'))
           return (
-            <div key={entry.id || index} className="grid gap-4 p-4 xl:grid-cols-[360px_1fr]">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <div className="grid gap-3">
-                  <Field label="Chọn bệnh nhân">
-                    <select className="field-input" value={entry.idbn} onChange={(event) => selectPatient(entryIndex, event.target.value)}>
-                      <option value="">Chọn theo IDBN - Họ tên</option>
-                      {selectPatients.map((item) => (
-                        <option key={item.idbn} value={item.idbn}>
-                          {item.idbn} - {item.fullName}
-                        </option>
-                      ))}
-                    </select>
-                  </Field>
+            <div key={section.key}>
+              <div className="flex flex-col gap-3 bg-slate-50 px-4 py-3 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-950">
+                    {sectionIndex + 1}. {section.title}
+                  </h3>
+                  <p className="text-xs text-slate-500">{sectionRows.length} bệnh nhân</p>
                 </div>
-                {patient ? (
-                  <dl className="mt-4 space-y-2 text-sm">
-                    <div>
-                      <dt className="font-semibold text-slate-500">Ngày diễn biến</dt>
-                      <dd className="text-slate-900">{formatDateVN(entry.progressDate)}</dd>
-                    </div>
-                    <div>
-                      <dt className="font-semibold text-slate-500">Loại báo cáo</dt>
-                      <dd className="text-slate-900">{entry.category || 'Theo dõi'}</dd>
-                    </div>
-                    <div>
-                      <dt className="font-semibold text-slate-500">Chẩn đoán</dt>
-                      <dd className="text-slate-900">{patient.diagnosis}</dd>
-                    </div>
-                    <div>
-                      <dt className="font-semibold text-slate-500">Bệnh sử</dt>
-                      <dd className="text-slate-700">{patient.history}</dd>
-                    </div>
-                    <div className="grid grid-cols-2 gap-2 text-slate-600">
-                      <span>Vào viện: {formatDateVN(patient.admissionDate)}</span>
-                      <span>Vào khoa: {formatDateVN(patient.departmentDate)}</span>
-                    </div>
-                  </dl>
-                ) : (
-                  <p className="mt-4 text-sm text-amber-700">Chưa chọn bệnh nhân từ Danh sách BN.</p>
-                )}
+                <button onClick={() => addEntry(section.category)} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-white px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-50">
+                  <Plus size={16} />
+                  Thêm bệnh nhân
+                </button>
               </div>
-              <div className="grid gap-4 md:grid-cols-2">
-                <div>
-                  <p className="field-label">Diễn biến lâm sàng</p>
-                  <p className="min-h-[104px] rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-900">{entry.clinicalProgress || '-'}</p>
-                </div>
-                <div>
-                  <p className="field-label">Cận lâm sàng</p>
-                  <p className="min-h-[104px] rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-900">{entry.paraclinical || '-'}</p>
-                </div>
-                <div>
-                  <p className="field-label">Can thiệp</p>
-                  <p className="min-h-[104px] rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-900">{entry.intervention || '-'}</p>
-                </div>
-                <div>
-                  <p className="field-label">Ghi chú</p>
-                  <p className="min-h-[104px] rounded-md border border-slate-200 bg-white p-3 text-sm text-slate-900">{entry.note || '-'}</p>
-                </div>
-                <div className="md:col-span-2">
-                  <button onClick={() => removeEntry(entryIndex)} className="inline-flex h-9 items-center gap-2 rounded-md px-3 text-sm font-semibold text-red-600 hover:bg-red-50">
-                    <Trash2 size={16} />
-                    Xóa khỏi báo cáo
-                  </button>
-                </div>
-              </div>
+              {sectionRows.length ? (
+                sectionRows.map((entry) => renderReportRow(entry, section))
+              ) : (
+                <p className="border-t border-slate-100 px-4 py-5 text-sm text-slate-500">Chưa chọn bệnh nhân cho phần này.</p>
+              )}
             </div>
           )
         })}
-        {!reportRows.length && (
-          <p className="px-4 py-6 text-center text-sm text-slate-500">
-            Bấm Thêm bệnh nhân báo cáo để chọn bệnh nhân có diễn biến trùng ngày báo cáo.
-          </p>
-        )}
       </div>
     </section>
   )
@@ -1949,6 +2568,22 @@ function PlaceholderView({ title }) {
 }
 
 function CatalogView({ catalogUnits, setCatalogUnits }) {
+  const [catalogSaveState, setCatalogSaveState] = useState('idle')
+  const [catalogMessage, setCatalogMessage] = useState('')
+
+  const persistCatalogUnits = async (nextUnits = catalogUnits) => {
+    setCatalogSaveState('saving')
+    setCatalogMessage('')
+    try {
+      const result = await saveDepartmentUnits(nextUnits)
+      setCatalogMessage(result.source === 'supabase' ? 'Đã lưu danh mục đơn vị lên Supabase.' : 'Đã lưu danh mục đơn vị trong trình duyệt.')
+    } catch (error) {
+      setCatalogMessage(`Lỗi lưu danh mục đơn vị: ${error.message}`)
+    } finally {
+      setCatalogSaveState('idle')
+    }
+  }
+
   const updateUnit = (index, field, value) => {
     setCatalogUnits((current) =>
       current.map((unit, unitIndex) =>
@@ -1973,7 +2608,9 @@ function CatalogView({ catalogUnits, setCatalogUnits }) {
   }
 
   const removeUnit = (index) => {
-    setCatalogUnits((current) => current.filter((_, unitIndex) => unitIndex !== index))
+    const nextUnits = catalogUnits.filter((_, unitIndex) => unitIndex !== index)
+    setCatalogUnits(nextUnits)
+    persistCatalogUnits(nextUnits)
   }
 
   return (
@@ -1983,11 +2620,22 @@ function CatalogView({ catalogUnits, setCatalogUnits }) {
           <h2 className="text-base font-semibold text-slate-950">Danh mục đơn vị</h2>
           <p className="text-sm text-slate-500">Thêm, sửa hoặc xóa đơn vị rồi bấm Lưu để cập nhật Supabase.</p>
         </div>
-        <button onClick={addUnit} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
-          <Plus size={16} />
-          Thêm đơn vị
-        </button>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <button onClick={() => persistCatalogUnits()} disabled={catalogSaveState === 'saving'} className="inline-flex h-9 items-center gap-2 rounded-md bg-hospital-600 px-3 text-sm font-semibold text-white hover:bg-hospital-700 disabled:cursor-not-allowed disabled:bg-slate-300">
+            <Save size={16} />
+            {catalogSaveState === 'saving' ? 'Đang lưu' : 'Lưu danh mục'}
+          </button>
+          <button onClick={addUnit} className="inline-flex h-9 items-center gap-2 rounded-md border border-hospital-200 bg-hospital-50 px-3 text-sm font-semibold text-hospital-700 hover:bg-hospital-100">
+            <Plus size={16} />
+            Thêm đơn vị
+          </button>
+        </div>
       </div>
+      {catalogMessage && (
+        <div className="border-b border-slate-200 px-4 py-3 text-sm font-medium text-hospital-700">
+          {catalogMessage}
+        </div>
+      )}
       <div className="overflow-x-auto">
         <table className="min-w-[1100px] w-full border-collapse border border-slate-200 text-left text-sm">
           <thead className="bg-slate-50 text-[12px] font-semibold uppercase tracking-normal text-slate-500">
@@ -2051,13 +2699,14 @@ export default function App() {
   const [patients, setPatients] = useState(initialPatientDirectory)
   const [reportEntries, setReportEntries] = useState(initialReportEntries)
   const [users, setUsers] = useState(initialUsers)
+  const [loggedInUser, setLoggedInUser] = useState(null)
   const [catalogUnits, setCatalogUnits] = useState(() => buildInitialCatalogUnits())
-  const loggedInUser = users[0]
+  const defaultUser = users[0]
   const initialReport = useMemo(
     () => ({
       ...defaultReportMeta,
       id: 'report-001',
-      reporter: loggedInUser?.fullName || defaultReportMeta.reporter,
+      reporter: defaultUser?.fullName || defaultReportMeta.reporter,
       ...computeDailyStats(initialPatientDirectory, defaultReportMeta.date),
     }),
     [],
@@ -2092,6 +2741,13 @@ export default function App() {
           setCatalogUnits(data.catalogUnits)
         }
 
+        if (data.patientProgress.length) {
+          setReportEntries((current) => [
+            ...current.filter((entry) => entry.source !== 'patient-progress'),
+            ...data.patientProgress,
+          ])
+        }
+
         if (data.reports.length) {
           const firstReport = data.reports[0]
           setReports(data.reports)
@@ -2099,7 +2755,10 @@ export default function App() {
 
           const entriesResult = await loadReportEntries(firstReport.id)
           if (!ignore) {
-            setReportEntries(entriesResult.entries)
+            setReportEntries([
+              ...entriesResult.entries,
+              ...data.patientProgress,
+            ])
           }
         }
 
@@ -2130,16 +2789,18 @@ export default function App() {
         idbn: entry.idbn,
         full_name: patient.fullName || '',
         birth_year: Number(patient.birthYear) || null,
-        admission_date: patient.admissionDate || null,
-        department_date: patient.departmentDate || null,
+          admission_date: normalizeToISO(patient.admissionDate) || null,
+          department_date: normalizeToISO(patient.departmentDate) || null,
         transfer_to: patient.transferTo || '',
         diagnosis: patient.diagnosis || '',
         history: patient.history || '',
         category: entry.category,
         clinical_progress: entry.clinicalProgress,
-        progress_date: entry.progressDate || report.date || todayISO(),
+          progress_date: normalizeToISO(entry.progressDate || report.date || todayISO()),
         paraclinical: entry.paraclinical,
         intervention: entry.intervention,
+        image_url: normalizeImageUrls(entry)[0] || '',
+        image_urls: normalizeImageUrls(entry),
         note: entry.note,
       }
       })
@@ -2193,7 +2854,7 @@ export default function App() {
   }
 
   const createReport = () => {
-    setReport(buildReportDraft(defaultReportMeta, patients, loggedInUser))
+    setReport(buildReportDraft(defaultReportMeta, patients, loggedInUser || users[0], catalogUnits))
     setReportMode('form')
     setMessage('')
   }
@@ -2206,9 +2867,13 @@ export default function App() {
     setMessage('')
 
     try {
+      const patientProgressEntries = reportEntries.filter((entry) => entry.source === 'patient-progress')
       const result = await loadReportEntries(reportId)
       if (result.source === 'supabase') {
-        setReportEntries(result.entries)
+        setReportEntries([
+          ...result.entries,
+          ...patientProgressEntries,
+        ])
       }
     } catch (error) {
       setMessage(`Loi tai chi tiet bao cao: ${error.message}`)
@@ -2219,14 +2884,14 @@ export default function App() {
     setMessage('')
 
     try {
-      await deleteDutyReport(reportId)
+      const result = await deleteDutyReport(reportId)
       setReports((current) => current.filter((item) => item.id !== reportId))
       if (report.id === reportId) {
         setReportMode('list')
       }
-      setMessage(isSupabaseConfigured ? 'Da xoa bao cao tren Supabase.' : '')
+      setMessage(result.source === 'supabase' ? 'Đã xóa báo cáo trên Supabase.' : 'Đã xóa báo cáo khỏi danh sách.')
     } catch (error) {
-      setMessage(`Loi xoa bao cao: ${error.message}`)
+      setMessage(`Lỗi xóa báo cáo: ${error.message}`)
     }
   }
 
@@ -2243,6 +2908,27 @@ export default function App() {
 
     window.addEventListener('afterprint', restoreTitle)
     window.print()
+  }
+
+  if (!loggedInUser) {
+    return (
+      <LoginScreen
+        users={users}
+        loadingMessage={message && message.includes('Dang tai du lieu') ? message : ''}
+        onLogin={(user) => {
+          const userUnitInfo = resolveUserUnitInfo(user, catalogUnits)
+          setLoggedInUser(user)
+          setMessage('')
+          setReport((current) => ({
+            ...current,
+            reporter: user.fullName || current.reporter,
+            block: userUnitInfo.block || current.block,
+            department: userUnitInfo.department || current.department,
+            doctor: user.fullName || current.doctor,
+          }))
+        }}
+      />
+    )
   }
 
   return (
@@ -2282,6 +2968,12 @@ export default function App() {
                       </button>
                     </>
                   )}
+                  {reportMode === 'form' && (
+                    <button onClick={handleSave} disabled={saveState === 'saving'} className="inline-flex h-9 items-center gap-2 rounded-md bg-hospital-600 px-4 text-sm font-semibold text-white hover:bg-hospital-700 disabled:cursor-not-allowed disabled:bg-slate-300">
+                      <Save size={16} />
+                      {saveState === 'saving' ? 'Đang lưu' : 'Lưu báo cáo'}
+                    </button>
+                  )}
                 </div>
               </div>
               {reportMode === 'view' ? (
@@ -2290,9 +2982,16 @@ export default function App() {
                 </div>
               ) : (
                 <>
-                  <ReportMetaForm report={report} setReport={setReport} patients={patients} />
+                  <ReportMetaForm report={report} setReport={setReport} patients={patients} catalogUnits={catalogUnits} />
                   <SummaryPanel report={report} setReport={setReport} />
                   <DepartmentReportEntries patients={patients} entries={reportEntries} setEntries={setReportEntries} reportDate={report.date} />
+                  <OtherContentPanel report={report} setReport={setReport} />
+                  <div className="flex justify-end">
+                    <button onClick={handleSave} disabled={saveState === 'saving'} className="inline-flex h-10 items-center gap-2 rounded-md bg-hospital-600 px-5 text-sm font-semibold text-white hover:bg-hospital-700 disabled:cursor-not-allowed disabled:bg-slate-300">
+                      <Save size={16} />
+                      {saveState === 'saving' ? 'Đang lưu' : 'Lưu báo cáo'}
+                    </button>
+                  </div>
                 </>
               )}
             </>
@@ -2304,10 +3003,11 @@ export default function App() {
             setPatients={setPatients}
             reportEntries={reportEntries}
             setReportEntries={setReportEntries}
+            setMessage={setMessage}
           />
         )}
         {activeMenu === 'users' && (
-          <UserDirectory users={users} setUsers={setUsers} onSave={handleSave} saveState={saveState} />
+          <UserDirectory users={users} setUsers={setUsers} catalogUnits={catalogUnits} onSave={handleSave} saveState={saveState} />
         )}
         {activeMenu === 'block-report' && <AggregatedPreview report={report} patients={patients} entries={reportEntries} />}
         {activeMenu === 'command-report' && <AggregatedPreview report={report} patients={patients} entries={reportEntries} />}

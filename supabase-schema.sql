@@ -1,3 +1,5 @@
+create extension if not exists pgcrypto;
+
 create table if not exists public.duty_reports (
   id uuid primary key default gen_random_uuid(),
   report_date date not null,
@@ -52,15 +54,17 @@ create table if not exists public.app_users (
 );
 
 create table if not exists public.department_units (
-  id uuid primary key default gen_random_uuid(),
-  unit_code text not null unique,
+  id uuid not null default gen_random_uuid(),
+  unit_code text not null,
   unit_name text not null,
   block_name text,
   unit_type text default 'Khoa',
   is_active boolean default true,
   display_order integer default 0,
   created_at timestamptz default now(),
-  updated_at timestamptz default now()
+  updated_at timestamptz default now(),
+  constraint department_units_pkey primary key (id),
+  constraint department_units_unit_code_key unique (unit_code)
 );
 
 create table if not exists public.duty_report_patients (
@@ -79,8 +83,25 @@ create table if not exists public.duty_report_patients (
   clinical_progress text,
   paraclinical text,
   intervention text,
+  image_url text,
+  image_urls jsonb default '[]'::jsonb,
   note text,
   created_at timestamptz default now()
+);
+
+create table if not exists public.patient_progress (
+  id uuid primary key default gen_random_uuid(),
+  idbn text not null references public.patients(idbn) on delete cascade,
+  progress_date date not null,
+  category text default 'Theo dõi',
+  clinical_progress text,
+  paraclinical text,
+  intervention text,
+  image_url text,
+  image_urls jsonb default '[]'::jsonb,
+  note text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
 );
 
 alter table public.duty_report_patients
@@ -91,7 +112,13 @@ alter table public.duty_report_patients
   add column if not exists clinical_progress text,
   add column if not exists paraclinical text,
   add column if not exists intervention text,
+  add column if not exists image_url text,
+  add column if not exists image_urls jsonb default '[]'::jsonb,
   add column if not exists note text;
+
+alter table public.patient_progress
+  add column if not exists image_url text,
+  add column if not exists image_urls jsonb default '[]'::jsonb;
 
 alter table public.duty_reports
   add column if not exists reporter_name text,
@@ -111,6 +138,7 @@ alter table public.patients enable row level security;
 alter table public.app_users enable row level security;
 alter table public.department_units enable row level security;
 alter table public.duty_report_patients enable row level security;
+alter table public.patient_progress enable row level security;
 
 drop policy if exists "full access" on public.duty_reports;
 create policy "full access"
@@ -152,6 +180,14 @@ to anon, authenticated
 using (true)
 with check (true);
 
+drop policy if exists "full access" on public.patient_progress;
+create policy "full access"
+on public.patient_progress
+for all
+to anon, authenticated
+using (true)
+with check (true);
+
 insert into public.department_units (unit_code, unit_name, block_name, unit_type, display_order)
 values
   ('A01', 'A01 Nội tim mạch', 'Khối Nội', 'Khoa', 10),
@@ -167,3 +203,39 @@ set
   unit_type = excluded.unit_type,
   display_order = excluded.display_order,
   updated_at = now();
+
+-- Ensure required columns exist (safe idempotent migration)
+alter table if exists public.duty_report_patients
+  add column if not exists report_id uuid,
+  add column if not exists category text,
+  add column if not exists progress_date date,
+  add column if not exists clinical_progress text,
+  add column if not exists paraclinical text,
+  add column if not exists intervention text,
+  add column if not exists note text,
+  add column if not exists created_at timestamptz default now();
+
+alter table if exists public.duty_reports
+  add column if not exists reporter_name text,
+  add column if not exists admissions integer default 0,
+  add column if not exists transfers_in integer default 0,
+  add column if not exists transfers_out integer default 0,
+  add column if not exists hospital_transfers integer default 0,
+  add column if not exists discharges integer default 0;
+
+alter table if exists public.patients
+  add column if not exists transfer_out_date date,
+  add column if not exists outcome text,
+  add column if not exists outcome_date date;
+
+alter table if exists public.department_units
+  add column if not exists unit_code text,
+  add column if not exists unit_name text,
+  add column if not exists block_name text,
+  add column if not exists unit_type text default 'Khoa',
+  add column if not exists is_active boolean default true,
+  add column if not exists display_order integer default 0;
+
+-- If report_id should be NOT NULL, enforce it after existing reports are migrated.
+-- alter table public.duty_report_patients
+--   alter column report_id set not null;
