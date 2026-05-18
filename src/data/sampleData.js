@@ -104,6 +104,10 @@ export const defaultReportMeta = {
   transfers: 2,
   emergencySurgery: 1,
   emergencyProcedure: 3,
+  specialSurgery: 0,
+  surgeryLevel1: 0,
+  surgeryLevel2: 0,
+  surgeryLevel3: 0,
   ctMri: 5,
   incidents: 'Thiếu 02 lọ thuốc vận mạch, đã báo dược trực.',
 }

@@ -20,6 +20,10 @@ create table if not exists public.duty_reports (
   transfers integer default 0,
   emergency_surgery integer default 0,
   emergency_procedure integer default 0,
+  special_surgery integer default 0,
+  surgery_level1 integer default 0,
+  surgery_level2 integer default 0,
+  surgery_level3 integer default 0,
   ct_mri integer default 0,
   incidents text,
   created_at timestamptz default now(),
@@ -126,7 +130,11 @@ alter table public.duty_reports
   add column if not exists transfers_in integer default 0,
   add column if not exists transfers_out integer default 0,
   add column if not exists hospital_transfers integer default 0,
-  add column if not exists discharges integer default 0;
+  add column if not exists discharges integer default 0,
+  add column if not exists special_surgery integer default 0,
+  add column if not exists surgery_level1 integer default 0,
+  add column if not exists surgery_level2 integer default 0,
+  add column if not exists surgery_level3 integer default 0;
 
 alter table public.patients
   add column if not exists transfer_out_date date,

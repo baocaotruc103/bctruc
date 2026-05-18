@@ -28,6 +28,10 @@ function mapReportFromDb(row) {
     transfers: row.transfers || 0,
     emergencySurgery: row.emergency_surgery || 0,
     emergencyProcedure: row.emergency_procedure || 0,
+    specialSurgery: row.special_surgery || 0,
+    surgeryLevel1: row.surgery_level1 || 0,
+    surgeryLevel2: row.surgery_level2 || 0,
+    surgeryLevel3: row.surgery_level3 || 0,
     ctMri: row.ct_mri || 0,
     incidents: row.incidents || '',
   }

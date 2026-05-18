@@ -17,7 +17,11 @@ ALTER TABLE IF EXISTS public.duty_reports
   ADD COLUMN IF NOT EXISTS transfers_in integer DEFAULT 0,
   ADD COLUMN IF NOT EXISTS transfers_out integer DEFAULT 0,
   ADD COLUMN IF NOT EXISTS hospital_transfers integer DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS discharges integer DEFAULT 0;
+  ADD COLUMN IF NOT EXISTS discharges integer DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS special_surgery integer DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS surgery_level1 integer DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS surgery_level2 integer DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS surgery_level3 integer DEFAULT 0;
 
 ALTER TABLE IF EXISTS public.patients
   ADD COLUMN IF NOT EXISTS transfer_out_date date,

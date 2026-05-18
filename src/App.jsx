@@ -1168,6 +1168,34 @@ function SummaryPanel({ report, setReport }) {
   )
 }
 
+function SurgeryCountPanel({ report, setReport }) {
+  const updateNumber = (field, value) =>
+    setReport((current) => ({ ...current, [field]: Number(value) || 0 }))
+
+  const surgeryFields = [
+    ['specialSurgery', 'PT Đặc biệt'],
+    ['surgeryLevel1', 'PTL1'],
+    ['surgeryLevel2', 'PTL2'],
+    ['surgeryLevel3', 'PTL3'],
+  ]
+
+  return (
+    <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-panel">
+      <div className="mb-4">
+        <h2 className="text-base font-semibold text-slate-950">Phẫu thuật mục 3</h2>
+        <p className="text-sm text-slate-500">Nhập số lượng phẫu thuật cấp cứu theo phân loại để hiển thị trong báo cáo trực.</p>
+      </div>
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+        {surgeryFields.map(([field, label]) => (
+          <Field key={field} label={label}>
+            <input className="field-input" type="number" min="0" value={report[field] || 0} onChange={(event) => updateNumber(field, event.target.value)} />
+          </Field>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function OtherContentPanel({ report, setReport }) {
   return (
     <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-panel">
@@ -2254,6 +2282,10 @@ function patientAge(patient) {
   return String(new Date().getFullYear() - year)
 }
 
+function reportCountValue(value) {
+  return value === 0 || value ? value : '........'
+}
+
 function DottedLine({ label, value }) {
   return (
     <p>
@@ -2334,7 +2366,7 @@ function DepartmentReportDetail({ report, patients, entries }) {
         <PatientDetailLines rows={groups.severeDischarge} patientById={patientById} diagnosisLabel="Chẩn đoán ra viện" />
 
         <p>3. Bệnh nhân cấp cứu trong ngày (đối với khoa nội)/Bệnh nhân và phẫu thuật/thủ thuật cấp cứu (đối với khoa ngoại): {groups.emergency.length}</p>
-        <p>PT Đặc biệt: ........ ; PTL1: ........; PTL2: ........; PTL3: ........</p>
+        <p>PT Đặc biệt: {reportCountValue(report.specialSurgery)} ; PTL1: {reportCountValue(report.surgeryLevel1)}; PTL2: {reportCountValue(report.surgeryLevel2)}; PTL3: {reportCountValue(report.surgeryLevel3)}</p>
         <p>Hoặc (TT Đặc biệt: ........ ; TT L1: ....; TT L2: ....; TT L3: ....)</p>
         <p>* Các trường hợp báo cáo chi tiết</p>
         <PatientDetailLines rows={groups.emergency} patientById={patientById} />
@@ -2830,6 +2862,10 @@ export default function App() {
         transfers: report.transfers,
         emergency_surgery: report.emergencySurgery,
         emergency_procedure: report.emergencyProcedure,
+        special_surgery: report.specialSurgery || 0,
+        surgery_level1: report.surgeryLevel1 || 0,
+        surgery_level2: report.surgeryLevel2 || 0,
+        surgery_level3: report.surgeryLevel3 || 0,
         ct_mri: report.ctMri,
         incidents: report.incidents,
         patient_directory: patients,
@@ -2984,6 +3020,7 @@ export default function App() {
                 <>
                   <ReportMetaForm report={report} setReport={setReport} patients={patients} catalogUnits={catalogUnits} />
                   <SummaryPanel report={report} setReport={setReport} />
+                  <SurgeryCountPanel report={report} setReport={setReport} />
                   <DepartmentReportEntries patients={patients} entries={reportEntries} setEntries={setReportEntries} reportDate={report.date} />
                   <OtherContentPanel report={report} setReport={setReport} />
                   <div className="flex justify-end">
