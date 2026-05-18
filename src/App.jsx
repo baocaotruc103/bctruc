@@ -2367,7 +2367,6 @@ function DepartmentReportDetail({ report, patients, entries }) {
 
         <p>3. Bệnh nhân cấp cứu trong ngày (đối với khoa nội)/Bệnh nhân và phẫu thuật/thủ thuật cấp cứu (đối với khoa ngoại): {groups.emergency.length}</p>
         <p>PT Đặc biệt: {reportCountValue(report.specialSurgery)} ; PTL1: {reportCountValue(report.surgeryLevel1)}; PTL2: {reportCountValue(report.surgeryLevel2)}; PTL3: {reportCountValue(report.surgeryLevel3)}</p>
-        <p>Hoặc (TT Đặc biệt: ........ ; TT L1: ....; TT L2: ....; TT L3: ....)</p>
         <p>* Các trường hợp báo cáo chi tiết</p>
         <PatientDetailLines rows={groups.emergency} patientById={patientById} />
 
